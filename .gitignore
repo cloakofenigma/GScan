@@ -1,0 +1,73 @@
+# G-Hunter .gitignore
+
+# Environment variables (CRITICAL - never commit!)
+.env
+.env.local
+.env.*.local
+
+# Output directories
+outputs/
+output/
+
+# Logs
+*.log
+ghunter.log
+scan.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Progress files (can be ignored if you don't want to commit progress)
+progress.json
+completed_queries.txt
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+temp/
+
+# Reports (may contain sensitive data)
+*report.html
+*scan_results.json
+*repos.txt
+*urls.txt
+
+# Git dorks (if you have custom sensitive patterns)
+# Uncomment if your dorks are proprietary:
+# gitDorks.txt
+# *.dorks

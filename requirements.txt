@@ -1,0 +1,17 @@
+# G-Hunter Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+aiohttp>=3.9.0
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+colorama>=0.4.6
+
+# AI Analysis (optional but recommended)
+google-generativeai>=0.3.0
+
+# Note: TruffleHog must be installed separately
+# Installation: https://github.com/trufflesecurity/trufflehog
+# - macOS: brew install trufflehog
+# - pip: pip install trufflehog
+# - Binary: Download from GitHub releases
