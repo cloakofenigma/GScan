@@ -27,10 +27,11 @@ import signal
 import subprocess
 import shutil
 import re
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import List, Set, Dict, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from concurrent.futures import ThreadPoolExecutor
 
 # Third-party imports with auto-install
@@ -72,6 +73,10 @@ class Config:
     retry_attempts: int = 3
     valid_extensions: Set[str] = None
     output_base_dir: Path = Path("outputs")
+    # Gitleaks integration settings
+    gitleaks_path: str = "/usr/local/bin/gitleaks"
+    clone_dir: str = "clones"  # Relative to output directory
+    scan_timeout: int = 600  # 10 minutes per repo scan
 
     def __post_init__(self):
         if self.valid_extensions is None:
@@ -98,6 +103,10 @@ class ScanProgress:
     completed_repos: Set[str] = None
     completed_urls: Set[str] = None
     completed_queries_set: Set[str] = None
+    # New fields for gitleaks integration
+    scan_tool: str = ""  # "trufflehog" | "gitleaks" | "both"
+    scanned_repos: Set[str] = None  # Repos fully scanned (for resume)
+    clone_failures: int = 0  # Failed clone attempts
 
     def __post_init__(self):
         if self.completed_repos is None:
@@ -106,6 +115,8 @@ class ScanProgress:
             self.completed_urls = set()
         if self.completed_queries_set is None:
             self.completed_queries_set = set()
+        if self.scanned_repos is None:
+            self.scanned_repos = set()
 
 @dataclass
 class SecretFinding:
@@ -122,6 +133,10 @@ class SecretFinding:
     false_positive: bool = False
     needs_review: bool = False
     severity: str = "UNKNOWN"
+    # New fields for multi-tool support
+    scan_tool: str = ""  # Primary tool that found it: "trufflehog" | "gitleaks"
+    found_by: List[str] = field(default_factory=list)  # All tools that found it
+    secret_hash: str = ""  # For deduplication (hash of secret value)
 
 # ==================== ASCII BANNER ====================
 
@@ -166,7 +181,7 @@ class GHunter:
         if self.config.gemini_api_key:
             try:
                 genai.configure(api_key=self.config.gemini_api_key)
-                self.gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+                self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
                 self.logger.info("Google Gemini AI initialized successfully")
             except Exception as e:
                 self.logger.warning(f"Failed to initialize Gemini: {e}")
@@ -184,10 +199,20 @@ class GHunter:
         return logging.getLogger('G-Hunter')
 
     def setup_signal_handlers(self):
-        """Setup graceful shutdown handlers"""
+        """Setup graceful shutdown handlers with clone cleanup"""
         def signal_handler(signum, frame):
-            self.logger.info("Received shutdown signal. Saving progress...")
+            self.logger.info("Received shutdown signal. Cleaning up...")
             self.shutdown_event.set()
+
+            # Cleanup any in-progress clone
+            if hasattr(self, '_current_clone_path') and self._current_clone_path:
+                try:
+                    if self._current_clone_path.exists():
+                        self.logger.info(f"Cleaning up interrupted clone: {self._current_clone_path}")
+                        shutil.rmtree(self._current_clone_path)
+                        self._current_clone_path = None
+                except Exception as e:
+                    self.logger.error(f"Failed to cleanup clone on interrupt: {e}")
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
@@ -204,9 +229,9 @@ class GHunter:
 ║     {Fore.WHITE}• Find exposed secrets, API keys, credentials{Fore.CYAN}                ║
 ║     {Fore.WHITE}• Save results to organized directories{Fore.CYAN}                      ║
 ║                                                                   ║
-║  {Fore.GREEN}2.{Fore.CYAN} Repo Scan - Deep scan repositories with TruffleHog          ║
-║     {Fore.WHITE}• Scan previously identified repositories{Fore.CYAN}                    ║
-║     {Fore.WHITE}• Use TruffleHog for verified secret detection{Fore.CYAN}               ║
+║  {Fore.GREEN}2.{Fore.CYAN} Repo Scan - Deep scan with TruffleHog/Gitleaks             ║
+║     {Fore.WHITE}• Choose: TruffleHog, Gitleaks, or Both{Fore.CYAN}                      ║
+║     {Fore.WHITE}• Clone-based local scanning for full history{Fore.CYAN}                ║
 ║     {Fore.WHITE}• AI-powered false positive reduction{Fore.CYAN}                        ║
 ║                                                                   ║
 ║  {Fore.GREEN}3.{Fore.CYAN} Generate HTML Report - Create professional reports          ║
@@ -232,18 +257,31 @@ class GHunter:
 {Fore.GREEN}OVERVIEW:{Style.RESET_ALL}
 G-Hunter is a professional-grade tool for identifying exposed secrets and
 sensitive information on GitHub repositories using advanced dorking techniques,
-TruffleHog scanning, and AI-powered analysis.
+TruffleHog/Gitleaks scanning, and AI-powered analysis.
 
 {Fore.GREEN}PREREQUISITES:{Style.RESET_ALL}
 1. GitHub Personal Access Token (PAT) with 'public_repo' scope
    → Create at: https://github.com/settings/tokens
 
-2. TruffleHog installed (for deep scanning)
-   → Install: brew install trufflehog (macOS)
-   → Install: pip install trufflehog (Python)
-   → Install: https://github.com/trufflesecurity/trufflehog/releases
+2. Git (required for repository cloning)
+   → Install: sudo apt install git (Linux)
+   → Install: brew install git (macOS)
 
-3. Google Gemini API Key (optional, for AI analysis)
+3. TruffleHog v3.x (for secret scanning - optional)
+   → Download binary: https://github.com/trufflesecurity/trufflehog/releases
+   → Linux install:
+     wget https://github.com/trufflesecurity/trufflehog/releases/download/v3.63.7/trufflehog_3.63.7_linux_amd64.tar.gz
+     tar -xzf trufflehog_3.63.7_linux_amd64.tar.gz
+     sudo mv trufflehog /usr/local/bin/
+
+4. Gitleaks (for secret scanning - optional)
+   → Download binary: https://github.com/gitleaks/gitleaks/releases
+   → Linux install:
+     wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz
+     tar -xzf gitleaks_8.18.2_linux_x64.tar.gz
+     sudo mv gitleaks /usr/local/bin/
+
+5. Google Gemini API Key (optional, for AI analysis)
    → Get at: https://makersuite.google.com/app/apikey
 
 {Fore.GREEN}CONFIGURATION:{Style.RESET_ALL}
@@ -257,20 +295,35 @@ Set environment variables in .env file:
    • Searches GitHub using keywords (company names, domains, usernames)
    • Combines keywords with git dorks for targeted searches
    • Creates organized output in: outputs/<keyword>/
-   • Saves repositories and file URLs separately
+   • Saves repository URLs in .git format for cloning
    • Supports resume functionality for interrupted scans
 
    {Fore.YELLOW}Example:{Style.RESET_ALL}
    Keywords: acme.com, acme-corp, acme
    Dorks file: gitDorks.txt
-   Output: outputs/acme.com/
+   Output: outputs/acme.com/repos.txt
 
 {Fore.CYAN}2. Repo Scan{Style.RESET_ALL}
-   • Performs deep scanning using TruffleHog
-   • Detects verified secrets (API keys, passwords, tokens)
-   • AI-powered false positive reduction
-   • Marks findings needing manual review
+   • Choose scanning tool: TruffleHog, Gitleaks, or Both
+   • Clones repositories locally for full history scanning
+   • Automatic deduplication when using both tools
+   • AI-powered false positive reduction (with Gemini)
    • Generates JSON results with detailed metadata
+
+   {Fore.YELLOW}Scanning Tools Comparison:{Style.RESET_ALL}
+   ┌────────────┬───────────────────────────────────────────┐
+   │ TruffleHog │ • Verifies secrets (checks if active)     │
+   │            │ • Best for API keys, tokens, passwords    │
+   │            │ • Fast with known patterns                │
+   ├────────────┼───────────────────────────────────────────┤
+   │ Gitleaks   │ • Comprehensive pattern matching          │
+   │            │ • Scans entire git history (--log-opts)   │
+   │            │ • Good for custom patterns                │
+   ├────────────┼───────────────────────────────────────────┤
+   │ Both       │ • Maximum coverage                        │
+   │            │ • Automatic deduplication                 │
+   │            │ • Tracks which tool found each secret     │
+   └────────────┴───────────────────────────────────────────┘
 
    {Fore.YELLOW}Example:{Style.RESET_ALL}
    Input: outputs/acme.com/repos.txt
@@ -278,10 +331,9 @@ Set environment variables in .env file:
 
 {Fore.CYAN}3. Generate HTML Report{Style.RESET_ALL}
    • Creates professional, interactive HTML dashboard
-   • Modern CSS/JS with filtering and sorting
-   • Color-coded severity levels (CRITICAL, HIGH, MEDIUM, LOW)
-   • False positive indicators
-   • Manual review markers
+   • Filter by: severity, verification status, scan tool
+   • Color-coded badges showing which tool found each secret
+   • False positive and manual review indicators
    • Exportable for stakeholders
 
    {Fore.YELLOW}Example:{Style.RESET_ALL}
@@ -292,6 +344,7 @@ Set environment variables in .env file:
 ✓ Always get authorization before scanning
 ✓ Respect GitHub's rate limits and ToS
 ✓ Use specific keywords for targeted results
+✓ Use "Both" option for maximum secret detection coverage
 ✓ Review AI-flagged items manually
 ✓ Revoke and rotate any exposed secrets immediately
 ✓ Report findings responsibly
@@ -446,10 +499,78 @@ For issues, questions, or contributions:
         self.logger.error(f"TruffleHog found at {trufflehog_path} but all verification methods failed")
         return False
 
+    def check_git(self) -> bool:
+        """Check if git is installed (required for cloning repositories)"""
+        git_path = shutil.which("git")
+        if not git_path:
+            self.logger.debug("Git not found in PATH")
+            return False
+
+        try:
+            result = subprocess.run(
+                ['git', '--version'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                self.logger.debug(f"Git found: {result.stdout.strip()}")
+                return True
+        except Exception as e:
+            self.logger.warning(f"Git check failed: {e}")
+
+        return False
+
+    def check_gitleaks(self) -> Tuple[bool, Optional[str]]:
+        """Check if Gitleaks is installed and return version"""
+        gitleaks_path = shutil.which("gitleaks")
+        if not gitleaks_path:
+            # Also check configured path
+            if os.path.isfile(self.config.gitleaks_path) and os.access(self.config.gitleaks_path, os.X_OK):
+                gitleaks_path = self.config.gitleaks_path
+            else:
+                self.logger.debug("Gitleaks not found in PATH or configured path")
+                return False, None
+
+        try:
+            result = subprocess.run(
+                [gitleaks_path, 'version'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                version = result.stdout.strip()
+                self.logger.debug(f"Gitleaks found: {version}")
+                return True, version
+        except Exception as e:
+            self.logger.warning(f"Gitleaks version check failed: {e}")
+
+        # Try alternative version command
+        try:
+            result = subprocess.run(
+                [gitleaks_path, '--version'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                version = result.stdout.strip()
+                return True, version
+        except Exception as e:
+            self.logger.warning(f"Gitleaks --version check failed: {e}")
+
+        # Check if executable exists
+        if os.path.isfile(gitleaks_path) and os.access(gitleaks_path, os.X_OK):
+            return True, "unknown"
+
+        return False, None
+
     def check_dependencies(self):
         """Check all required dependencies"""
         issues = []
         successes = []
+        warnings = []
 
         # Check GitHub token
         if not self.config.github_token:
@@ -459,10 +580,23 @@ For issues, questions, or contributions:
             masked_token = self.config.github_token[:10] + "..." if len(self.config.github_token) > 10 else "***"
             successes.append(f"GitHub token configured ({masked_token})")
 
+        # Check Git (required for cloning)
+        git_installed = self.check_git()
+        if not git_installed:
+            issues.append("Git not installed (required for Repo Scan)")
+        else:
+            try:
+                result = subprocess.run(['git', '--version'],
+                                      capture_output=True, text=True, timeout=5)
+                version = result.stdout.strip() if result.returncode == 0 else "unknown"
+                successes.append(f"Git installed ({version})")
+            except:
+                successes.append("Git installed")
+
         # Check TruffleHog for repo scanning
         trufflehog_installed = self.check_trufflehog()
         if not trufflehog_installed:
-            issues.append("TruffleHog not installed (required for Repo Scan)")
+            warnings.append("TruffleHog not installed (optional - for TruffleHog scanning)")
         else:
             try:
                 result = subprocess.run(['trufflehog', '--version'],
@@ -471,6 +605,13 @@ For issues, questions, or contributions:
                 successes.append(f"TruffleHog installed ({version})")
             except:
                 successes.append("TruffleHog installed")
+
+        # Check Gitleaks for repo scanning
+        gitleaks_installed, gitleaks_version = self.check_gitleaks()
+        if not gitleaks_installed:
+            warnings.append("Gitleaks not installed (optional - for Gitleaks scanning)")
+        else:
+            successes.append(f"Gitleaks installed ({gitleaks_version or 'unknown'})")
 
         # Check Gemini API
         if self.config.gemini_api_key:
@@ -482,8 +623,13 @@ For issues, questions, or contributions:
             for success in successes:
                 print(f"  • {success}")
 
+        if warnings:
+            print(f"\n{Fore.YELLOW}⚠️  Optional Dependencies:{Style.RESET_ALL}")
+            for warning in warnings:
+                print(f"  • {warning}")
+
         if issues:
-            print(f"\n{Fore.RED}⚠️  Dependency Issues:{Style.RESET_ALL}")
+            print(f"\n{Fore.RED}✗ Dependency Issues:{Style.RESET_ALL}")
             for issue in issues:
                 print(f"  • {issue}")
             print(f"\n{Fore.YELLOW}Run option 4 (Help) for installation instructions{Style.RESET_ALL}\n")
@@ -522,7 +668,11 @@ For issues, questions, or contributions:
                 'start_time': self.progress.start_time,
                 'completed_repos': list(self.progress.completed_repos),
                 'completed_urls': list(self.progress.completed_urls),
-                'completed_queries_set': list(self.progress.completed_queries_set)
+                'completed_queries_set': list(self.progress.completed_queries_set),
+                # New fields for gitleaks integration
+                'scan_tool': self.progress.scan_tool,
+                'scanned_repos': list(self.progress.scanned_repos),
+                'clone_failures': self.progress.clone_failures
             }
             with open(progress_file, 'w') as f:
                 json.dump(progress_data, f, indent=2)
@@ -551,6 +701,10 @@ For issues, questions, or contributions:
                 progress.completed_repos = set(data.get('completed_repos', []))
                 progress.completed_urls = set(data.get('completed_urls', []))
                 progress.completed_queries_set = set(data.get('completed_queries_set', []))
+                # New fields for gitleaks integration
+                progress.scan_tool = data.get('scan_tool', '')
+                progress.scanned_repos = set(data.get('scanned_repos', []))
+                progress.clone_failures = data.get('clone_failures', 0)
 
                 self.logger.info(f"Loaded progress: {progress.completed_queries}/{progress.total_queries} queries")
                 return progress
@@ -558,6 +712,63 @@ For issues, questions, or contributions:
                 self.logger.error(f"Error loading progress: {e}")
 
         return ScanProgress()
+
+    def get_repo_name_from_url(self, repo_url: str) -> str:
+        """Extract repository name from URL"""
+        # Handle URLs like https://github.com/username/reponame.git
+        name = repo_url.rstrip('/').split('/')[-1]
+        if name.endswith('.git'):
+            name = name[:-4]
+        return name
+
+    def clone_repository(self, repo_url: str, clone_dir: Path) -> Tuple[bool, Optional[Path]]:
+        """Clone a repository to the specified directory"""
+        repo_name = self.get_repo_name_from_url(repo_url)
+        clone_path = clone_dir / repo_name
+
+        # Remove existing clone if present
+        if clone_path.exists():
+            self.cleanup_clone(clone_path)
+
+        try:
+            self.logger.info(f"Cloning {repo_url} to {clone_path}")
+            result = subprocess.run(
+                ['git', 'clone', '--quiet', repo_url, str(clone_path)],
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout for clone
+            )
+
+            if result.returncode == 0:
+                self.logger.info(f"Successfully cloned {repo_name}")
+                return True, clone_path
+            else:
+                self.logger.error(f"Clone failed for {repo_url}: {result.stderr}")
+                return False, None
+
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"Clone timeout for {repo_url}")
+            # Cleanup partial clone
+            if clone_path.exists():
+                self.cleanup_clone(clone_path)
+            return False, None
+        except Exception as e:
+            self.logger.error(f"Clone error for {repo_url}: {e}")
+            if clone_path.exists():
+                self.cleanup_clone(clone_path)
+            return False, None
+
+    def cleanup_clone(self, clone_path: Path):
+        """Remove cloned repository directory"""
+        try:
+            if clone_path.exists():
+                shutil.rmtree(clone_path)
+                self.logger.debug(f"Cleaned up {clone_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to cleanup {clone_path}: {e}")
+
+    # Track current clone path for cleanup on interrupt
+    _current_clone_path: Optional[Path] = None
 
     async def create_session(self):
         """Create async HTTP session"""
@@ -595,6 +806,9 @@ For issues, questions, or contributions:
                                 repo_url = item["repository"]["html_url"]
                                 file_url = item["html_url"]
 
+                                # Append .git suffix for clone compatibility
+                                if not repo_url.endswith(".git"):
+                                    repo_url = repo_url + ".git"
                                 repos.add(repo_url)
 
                                 # Check file extension
@@ -826,6 +1040,199 @@ Respond in JSON format:
                 "reason": f"AI error: {str(e)}"
             }
 
+    def run_trufflehog_local(self, clone_path: Path, repo_url: str) -> List[SecretFinding]:
+        """Run TruffleHog scan on a local clone using file:// protocol"""
+        findings = []
+
+        try:
+            # Use file:// protocol to scan local clone with full git history
+            file_url = f"file://{clone_path.absolute()}"
+
+            self.logger.info(f"Running TruffleHog on {clone_path}")
+            result = subprocess.run(
+                ['trufflehog', 'git', file_url, '--json', '--no-update'],
+                capture_output=True,
+                text=True,
+                timeout=self.config.scan_timeout
+            )
+
+            if result.stdout:
+                for line in result.stdout.strip().splitlines():
+                    try:
+                        secret_data = json.loads(line)
+
+                        # Extract secret value for hashing (for deduplication)
+                        raw_secret = secret_data.get('Raw', '')
+                        secret_hash = hashlib.sha256(raw_secret.encode()).hexdigest()[:16] if raw_secret else ''
+
+                        finding = SecretFinding(
+                            detector_type=secret_data.get('DetectorType', 'Unknown'),
+                            detector_name=secret_data.get('DetectorName', 'Unknown'),
+                            verified=secret_data.get('Verified', False),
+                            raw_result=line,
+                            repo_url=repo_url,
+                            file_path=secret_data.get('SourceMetadata', {}).get('Data', {}).get('Git', {}).get('file',
+                                      secret_data.get('SourceMetadata', {}).get('Data', {}).get('Filesystem', {}).get('file', 'Unknown')),
+                            commit=secret_data.get('SourceMetadata', {}).get('Data', {}).get('Git', {}).get('commit', 'Unknown'),
+                            timestamp=datetime.now().isoformat(),
+                            scan_tool="trufflehog",
+                            found_by=["trufflehog"],
+                            secret_hash=secret_hash
+                        )
+
+                        findings.append(finding)
+
+                    except json.JSONDecodeError:
+                        continue
+
+            # Log errors (filter out harmless updater errors)
+            if result.stderr:
+                stderr_lower = result.stderr.lower()
+                if "error" in stderr_lower and "updater" not in stderr_lower:
+                    self.logger.warning(f"TruffleHog stderr: {result.stderr[:200]}")
+
+        except subprocess.TimeoutExpired:
+            self.logger.warning(f"TruffleHog timeout for {clone_path}")
+        except Exception as e:
+            self.logger.error(f"TruffleHog error for {clone_path}: {e}")
+
+        return findings
+
+    def run_gitleaks_local(self, clone_path: Path, repo_url: str, output_file: Path) -> List[SecretFinding]:
+        """Run Gitleaks scan on a local clone with full git history"""
+        findings = []
+
+        try:
+            self.logger.info(f"Running Gitleaks on {clone_path}")
+
+            # Run gitleaks with full history scan
+            result = subprocess.run(
+                ['gitleaks', 'detect',
+                 '--source', str(clone_path),
+                 '--log-opts', '--all',  # Scan entire git history
+                 '--report-format', 'json',
+                 '--report-path', str(output_file),
+                 '-v'],
+                capture_output=True,
+                text=True,
+                timeout=self.config.scan_timeout
+            )
+
+            # Gitleaks returns exit code 1 if leaks found, 0 if no leaks
+            # Parse the output file
+            if output_file.exists():
+                findings = self.parse_gitleaks_results(output_file, repo_url)
+
+            # Log any errors
+            if result.returncode not in [0, 1] and result.stderr:
+                self.logger.warning(f"Gitleaks stderr: {result.stderr[:200]}")
+
+        except subprocess.TimeoutExpired:
+            self.logger.warning(f"Gitleaks timeout for {clone_path}")
+        except Exception as e:
+            self.logger.error(f"Gitleaks error for {clone_path}: {e}")
+
+        return findings
+
+    def parse_gitleaks_results(self, json_file: Path, repo_url: str) -> List[SecretFinding]:
+        """Parse Gitleaks JSON output into SecretFinding objects"""
+        findings = []
+
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+
+            if not isinstance(data, list):
+                data = [data] if data else []
+
+            for item in data:
+                # Extract secret value for hashing (for deduplication)
+                raw_secret = item.get('Secret', '')
+                secret_hash = hashlib.sha256(raw_secret.encode()).hexdigest()[:16] if raw_secret else ''
+
+                finding = SecretFinding(
+                    detector_type=item.get('RuleID', 'Unknown'),
+                    detector_name=item.get('Description', item.get('RuleID', 'Unknown')),
+                    verified=False,  # Gitleaks doesn't verify secrets
+                    raw_result=json.dumps(item),
+                    repo_url=repo_url,
+                    file_path=item.get('File', 'Unknown'),
+                    commit=item.get('Commit', 'Unknown'),
+                    timestamp=datetime.now().isoformat(),
+                    scan_tool="gitleaks",
+                    found_by=["gitleaks"],
+                    secret_hash=secret_hash
+                )
+
+                findings.append(finding)
+
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to parse Gitleaks JSON: {e}")
+        except Exception as e:
+            self.logger.error(f"Error parsing Gitleaks results: {e}")
+
+        return findings
+
+    def deduplicate_findings(self, findings: List[SecretFinding]) -> List[SecretFinding]:
+        """Deduplicate findings from multiple tools based on repo+file+secret_hash"""
+        deduplicated = {}
+
+        for finding in findings:
+            # Create unique key based on repo, file, and secret hash
+            key = f"{finding.repo_url}:{finding.file_path}:{finding.secret_hash}"
+
+            if key in deduplicated:
+                # Merge found_by lists
+                existing = deduplicated[key]
+                for tool in finding.found_by:
+                    if tool not in existing.found_by:
+                        existing.found_by.append(tool)
+                # If one tool verified, keep it verified
+                if finding.verified:
+                    existing.verified = True
+                # Update scan_tool to indicate both if different
+                if finding.scan_tool not in existing.scan_tool:
+                    existing.scan_tool = "both"
+            else:
+                deduplicated[key] = finding
+
+        return list(deduplicated.values())
+
+    def display_tool_selection_menu(self) -> Optional[str]:
+        """Display tool selection menu and return user choice"""
+        menu = f"""
+{Fore.CYAN}╔══════════════════════════════════════════════════════════════╗
+║                  SELECT SCANNING TOOL                        ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  {Fore.GREEN}1.{Fore.CYAN} TruffleHog  - Fast, good at known secret patterns       ║
+║     {Fore.WHITE}• Verifies secrets where possible{Fore.CYAN}                       ║
+║     {Fore.WHITE}• Best for API keys, tokens, passwords{Fore.CYAN}                  ║
+║                                                              ║
+║  {Fore.GREEN}2.{Fore.CYAN} Gitleaks    - Comprehensive, full git history scan      ║
+║     {Fore.WHITE}• Scans entire commit history{Fore.CYAN}                           ║
+║     {Fore.WHITE}• Good pattern-based detection{Fore.CYAN}                          ║
+║                                                              ║
+║  {Fore.GREEN}3.{Fore.CYAN} Both        - Maximum coverage (sequential scan)        ║
+║     {Fore.WHITE}• Run both tools on each repository{Fore.CYAN}                     ║
+║     {Fore.WHITE}• Deduplicates findings automatically{Fore.CYAN}                   ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}
+"""
+        print(menu)
+
+        choice = input(f"{Fore.GREEN}Enter your choice [1-3]:{Style.RESET_ALL} ").strip()
+
+        if choice == "1":
+            return "trufflehog"
+        elif choice == "2":
+            return "gitleaks"
+        elif choice == "3":
+            return "both"
+        else:
+            print(f"{Fore.RED}Invalid choice!{Style.RESET_ALL}")
+            return None
+
     def run_trufflehog_scan(self, repo_file: str, output_dir: Path):
         """Run TruffleHog scan on repositories"""
         if not os.path.exists(repo_file):
@@ -994,31 +1401,237 @@ Respond in JSON format:
         print(f"\nResults saved to: {results_file}\n")
 
     async def repo_scan(self):
-        """Repository scan functionality"""
+        """Repository scan functionality with tool selection"""
         print(f"\n{Fore.CYAN}╔══════════════════════════════════════════════════════════════╗")
-        print(f"║         Repo Scan - TruffleHog Deep Scanning                ║")
+        print(f"║         Repo Scan - Deep Secret Scanning                    ║")
         print(f"╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}\n")
 
-        # Check TruffleHog
-        if not self.check_trufflehog():
-            print(f"{Fore.RED}TruffleHog not found!{Style.RESET_ALL}")
-            print(f"{Fore.YELLOW}Please install TruffleHog and run this tool again.{Style.RESET_ALL}")
-            print("Installation: https://github.com/trufflesecurity/trufflehog\n")
+        # Check Git (required for cloning)
+        if not self.check_git():
+            print(f"{Fore.RED}Git not found!{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}Git is required for cloning repositories.{Style.RESET_ALL}")
+            print("Installation: sudo apt install git\n")
             return
 
+        # Check available tools
+        trufflehog_available = self.check_trufflehog()
+        gitleaks_available, gitleaks_version = self.check_gitleaks()
+
+        if not trufflehog_available and not gitleaks_available:
+            print(f"{Fore.RED}No scanning tools found!{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}Please install at least one of:{Style.RESET_ALL}")
+            print("  • TruffleHog: https://github.com/trufflesecurity/trufflehog/releases")
+            print("  • Gitleaks: https://github.com/gitleaks/gitleaks/releases\n")
+            return
+
+        # Display tool selection menu
+        scan_tool = self.display_tool_selection_menu()
+        if not scan_tool:
+            return
+
+        # Validate tool availability based on selection
+        if scan_tool == "trufflehog" and not trufflehog_available:
+            print(f"{Fore.RED}TruffleHog not installed!{Style.RESET_ALL}")
+            return
+        if scan_tool == "gitleaks" and not gitleaks_available:
+            print(f"{Fore.RED}Gitleaks not installed!{Style.RESET_ALL}")
+            return
+        if scan_tool == "both":
+            if not trufflehog_available:
+                print(f"{Fore.YELLOW}Warning: TruffleHog not available, using Gitleaks only{Style.RESET_ALL}")
+                scan_tool = "gitleaks"
+            elif not gitleaks_available:
+                print(f"{Fore.YELLOW}Warning: Gitleaks not available, using TruffleHog only{Style.RESET_ALL}")
+                scan_tool = "trufflehog"
+
         # Get repo file path
-        repo_file = input(f"{Fore.GREEN}Enter path to repos file:{Style.RESET_ALL} ").strip()
+        repo_file = input(f"\n{Fore.GREEN}Enter path to repos file:{Style.RESET_ALL} ").strip()
 
         if not os.path.exists(repo_file):
             print(f"{Fore.RED}Error: Repo file '{repo_file}' not found!{Style.RESET_ALL}")
+            return
+
+        # Load repositories
+        with open(repo_file, 'r') as f:
+            repos = [line.strip() for line in f if line.strip()]
+
+        if not repos:
+            print(f"{Fore.RED}No repositories found in file!{Style.RESET_ALL}")
             return
 
         # Determine output directory
         repo_path = Path(repo_file)
         output_dir = repo_path.parent
 
-        # Run scan
-        self.run_trufflehog_scan(repo_file, output_dir)
+        # Create clones directory
+        clone_dir = output_dir / self.config.clone_dir
+        clone_dir.mkdir(parents=True, exist_ok=True)
+
+        # Reset progress for this scan
+        self.progress = ScanProgress()
+        self.progress.scan_tool = scan_tool
+        self.progress.start_time = time.time()
+
+        # Prepare output files
+        results_file = output_dir / "scan_results.json"
+        trufflehog_raw_file = output_dir / "trufflehog_raw.json"
+        gitleaks_raw_file = output_dir / "gitleaks_raw.json"
+
+        all_findings: List[SecretFinding] = []
+
+        print(f"\n{Fore.YELLOW}Starting {scan_tool.upper()} scan of {len(repos)} repositories...{Style.RESET_ALL}")
+        print(f"Clone directory: {clone_dir}")
+        print(f"Output directory: {output_dir}\n")
+
+        with tqdm(total=len(repos), desc="Scanning repos") as pbar:
+            for repo_url in repos:
+                if self.shutdown_event.is_set():
+                    print(f"\n{Fore.YELLOW}Scan interrupted. Cleaning up...{Style.RESET_ALL}")
+                    break
+
+                # Skip if already scanned (for resume capability)
+                if repo_url in self.progress.scanned_repos:
+                    pbar.update(1)
+                    continue
+
+                repo_name = self.get_repo_name_from_url(repo_url)
+                pbar.set_description(f"Cloning {repo_name}")
+
+                # Clone repository
+                success, clone_path = self.clone_repository(repo_url, clone_dir)
+
+                if not success:
+                    self.progress.clone_failures += 1
+                    self.progress.errors += 1
+                    pbar.update(1)
+                    pbar.set_postfix({'Errors': self.progress.errors, 'Secrets': self.progress.secrets_found})
+                    continue
+
+                # Track current clone for cleanup on interrupt
+                self._current_clone_path = clone_path
+
+                repo_findings = []
+
+                try:
+                    # Run selected tool(s)
+                    if scan_tool in ["trufflehog", "both"] and trufflehog_available:
+                        pbar.set_description(f"TruffleHog: {repo_name}")
+                        tf_findings = self.run_trufflehog_local(clone_path, repo_url)
+                        repo_findings.extend(tf_findings)
+
+                    if scan_tool in ["gitleaks", "both"] and gitleaks_available:
+                        pbar.set_description(f"Gitleaks: {repo_name}")
+                        gl_output = clone_dir / f"{repo_name}_gitleaks.json"
+                        gl_findings = self.run_gitleaks_local(clone_path, repo_url, gl_output)
+                        repo_findings.extend(gl_findings)
+                        # Cleanup gitleaks output file
+                        if gl_output.exists():
+                            gl_output.unlink()
+
+                    # Update progress
+                    for finding in repo_findings:
+                        self.progress.secrets_found += 1
+                        if finding.verified:
+                            self.progress.verified_secrets += 1
+
+                    all_findings.extend(repo_findings)
+
+                finally:
+                    # Always cleanup clone
+                    pbar.set_description(f"Cleanup: {repo_name}")
+                    self.cleanup_clone(clone_path)
+                    self._current_clone_path = None
+
+                # Mark repo as scanned
+                self.progress.scanned_repos.add(repo_url)
+
+                pbar.update(1)
+                pbar.set_postfix({
+                    'Secrets': self.progress.secrets_found,
+                    'Errors': self.progress.errors
+                })
+
+        # Deduplicate findings if both tools were used
+        if scan_tool == "both" and len(all_findings) > 0:
+            print(f"\n{Fore.CYAN}Deduplicating {len(all_findings)} findings...{Style.RESET_ALL}")
+            all_findings = self.deduplicate_findings(all_findings)
+            print(f"{Fore.GREEN}✓ {len(all_findings)} unique findings after deduplication{Style.RESET_ALL}")
+
+        # AI Analysis if Gemini available
+        if self.gemini_model and all_findings:
+            print(f"\n{Fore.YELLOW}Running AI analysis on {len(all_findings)} findings...{Style.RESET_ALL}\n")
+
+            with tqdm(total=len(all_findings), desc="AI Analysis") as pbar:
+                for finding in all_findings:
+                    if self.shutdown_event.is_set():
+                        break
+
+                    analysis = await self.analyze_with_gemini(finding)
+                    finding.ai_analysis = analysis
+                    finding.false_positive = analysis.get('false_positive', False)
+                    finding.needs_review = analysis.get('needs_review', False)
+                    finding.severity = analysis.get('severity', 'UNKNOWN')
+
+                    if finding.false_positive:
+                        self.progress.false_positives += 1
+                    if finding.needs_review:
+                        self.progress.needs_manual_review += 1
+
+                    pbar.update(1)
+                    time.sleep(0.5)  # Rate limit Gemini API
+
+        # Save results
+        with open(results_file, 'w') as f:
+            for finding in all_findings:
+                f.write(json.dumps({
+                    'detector_type': finding.detector_type,
+                    'detector_name': finding.detector_name,
+                    'verified': finding.verified,
+                    'repo_url': finding.repo_url,
+                    'file_path': finding.file_path,
+                    'commit': finding.commit,
+                    'timestamp': finding.timestamp,
+                    'severity': finding.severity,
+                    'false_positive': finding.false_positive,
+                    'needs_review': finding.needs_review,
+                    'ai_analysis': finding.ai_analysis,
+                    'raw_result': finding.raw_result,
+                    'scan_tool': finding.scan_tool,
+                    'found_by': finding.found_by
+                }) + '\n')
+
+        # Cleanup clones directory if empty
+        try:
+            if clone_dir.exists() and not any(clone_dir.iterdir()):
+                clone_dir.rmdir()
+        except:
+            pass
+
+        # Calculate statistics
+        elapsed_time = time.time() - self.progress.start_time
+        found_by_trufflehog = sum(1 for f in all_findings if 'trufflehog' in f.found_by)
+        found_by_gitleaks = sum(1 for f in all_findings if 'gitleaks' in f.found_by)
+        found_by_both = sum(1 for f in all_findings if len(f.found_by) > 1)
+
+        # Display results
+        print(f"\n{Fore.GREEN}╔══════════════════════════════════════════════════════════════╗")
+        print(f"║                    Scan Completed!                          ║")
+        print(f"╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}")
+        print(f"Time elapsed: {elapsed_time:.2f} seconds")
+        print(f"Repositories scanned: {len(self.progress.scanned_repos)}")
+        print(f"Clone failures: {self.progress.clone_failures}")
+        print(f"\n{Fore.CYAN}Findings Summary:{Style.RESET_ALL}")
+        print(f"  Total secrets found: {self.progress.secrets_found}")
+        print(f"  Verified secrets: {self.progress.verified_secrets}")
+        if scan_tool == "both":
+            print(f"  Found by TruffleHog: {found_by_trufflehog}")
+            print(f"  Found by Gitleaks: {found_by_gitleaks}")
+            print(f"  Found by Both: {found_by_both}")
+        if self.gemini_model:
+            print(f"  False positives (AI): {self.progress.false_positives}")
+            print(f"  Needs manual review: {self.progress.needs_manual_review}")
+        print(f"  Errors: {self.progress.errors}")
+        print(f"\nResults saved to: {results_file}\n")
 
     def generate_html_report(self, results_file: str):
         """Generate professional HTML report"""
@@ -1052,6 +1665,10 @@ Respond in JSON format:
         high = sum(1 for f in findings if f.get('severity') == 'HIGH')
         medium = sum(1 for f in findings if f.get('severity') == 'MEDIUM')
         low = sum(1 for f in findings if f.get('severity') == 'LOW')
+        # Tool-specific statistics
+        by_trufflehog = sum(1 for f in findings if 'trufflehog' in f.get('found_by', [f.get('scan_tool', '')]))
+        by_gitleaks = sum(1 for f in findings if 'gitleaks' in f.get('found_by', [f.get('scan_tool', '')]))
+        by_both_tools = sum(1 for f in findings if len(f.get('found_by', [])) > 1)
 
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1258,6 +1875,14 @@ Respond in JSON format:
         .badge-severity.medium {{ background: #ffc107; color: #333; }}
         .badge-severity.low {{ background: #28a745; }}
 
+        .badge-tool {{
+            font-size: 0.75em;
+            padding: 3px 8px;
+        }}
+        .badge-trufflehog {{ background: #6f42c1; color: white; }}
+        .badge-gitleaks {{ background: #20c997; color: white; }}
+        .badge-both {{ background: #17a2b8; color: white; }}
+
         .finding-body {{
             padding: 20px;
             display: none;
@@ -1357,6 +1982,18 @@ Respond in JSON format:
                 <div class="stat-label">Needs Review</div>
                 <div class="stat-value" style="color: #fd7e14;">{needs_review}</div>
             </div>
+            <div class="stat-card">
+                <div class="stat-label" style="color: #6f42c1;">TruffleHog</div>
+                <div class="stat-value" style="color: #6f42c1;">{by_trufflehog}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label" style="color: #20c997;">Gitleaks</div>
+                <div class="stat-value" style="color: #20c997;">{by_gitleaks}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label" style="color: #17a2b8;">Found by Both</div>
+                <div class="stat-value" style="color: #17a2b8;">{by_both_tools}</div>
+            </div>
         </div>
 
         <div class="controls">
@@ -1375,6 +2012,12 @@ Respond in JSON format:
                 <button class="filter-btn" onclick="filterByType('false_positive')">Hide False Positives</button>
                 <button class="filter-btn" onclick="filterByType('needs_review')">Needs Review</button>
             </div>
+            <div class="filter-group">
+                <button class="filter-btn active" onclick="filterByTool('all')" id="tool-all">All Tools</button>
+                <button class="filter-btn" onclick="filterByTool('trufflehog')" id="tool-trufflehog" style="border-color: #6f42c1;">TruffleHog</button>
+                <button class="filter-btn" onclick="filterByTool('gitleaks')" id="tool-gitleaks" style="border-color: #20c997;">Gitleaks</button>
+                <button class="filter-btn" onclick="filterByTool('both')" id="tool-both" style="border-color: #17a2b8;">Both Tools</button>
+            </div>
         </div>
 
         <div class="findings" id="findingsContainer">
@@ -1386,7 +2029,28 @@ Respond in JSON format:
             verified_badge = 'badge-verified' if finding.get('verified') else 'badge-unverified'
             verified_text = 'Verified' if finding.get('verified') else 'Unverified'
 
-            badges_html = f'<span class="badge {verified_badge}">{verified_text}</span>'
+            # Determine scan tool for badge and filtering
+            found_by = finding.get('found_by', [])
+            scan_tool = finding.get('scan_tool', '')
+            if len(found_by) > 1:
+                tool_class = 'badge-both'
+                tool_text = 'Both'
+                tool_data = 'both'
+            elif 'trufflehog' in found_by or scan_tool == 'trufflehog':
+                tool_class = 'badge-trufflehog'
+                tool_text = 'TruffleHog'
+                tool_data = 'trufflehog'
+            elif 'gitleaks' in found_by or scan_tool == 'gitleaks':
+                tool_class = 'badge-gitleaks'
+                tool_text = 'Gitleaks'
+                tool_data = 'gitleaks'
+            else:
+                tool_class = 'badge-tool'
+                tool_text = 'Unknown'
+                tool_data = 'unknown'
+
+            badges_html = f'<span class="badge badge-tool {tool_class}">{tool_text}</span>'
+            badges_html += f'<span class="badge {verified_badge}">{verified_text}</span>'
             badges_html += f'<span class="badge badge-severity {severity}">{finding.get("severity", "UNKNOWN")}</span>'
 
             if finding.get('false_positive'):
@@ -1408,7 +2072,8 @@ Respond in JSON format:
             html_content += f"""
             <div class="finding-card" data-severity="{severity}" data-verified="{str(finding.get('verified')).lower()}"
                  data-false-positive="{str(finding.get('false_positive')).lower()}"
-                 data-needs-review="{str(finding.get('needs_review')).lower()}">
+                 data-needs-review="{str(finding.get('needs_review')).lower()}"
+                 data-tool="{tool_data}">
                 <div class="finding-header" onclick="toggleFinding({idx})">
                     <div class="finding-title">
                         {finding.get('detector_name', 'Unknown Detector')} - {finding.get('detector_type', 'Unknown Type')}
@@ -1453,6 +2118,7 @@ Respond in JSON format:
     <script>
         let currentSeverityFilter = 'all';
         let currentTypeFilter = null;
+        let currentToolFilter = 'all';
 
         function toggleFinding(id) {
             const body = document.getElementById('finding-' + id);
@@ -1462,12 +2128,12 @@ Respond in JSON format:
         function filterBySeverity(severity) {
             currentSeverityFilter = severity;
 
-            // Update button states
-            document.querySelectorAll('.filter-btn').forEach(btn => {
+            // Update button states for severity
+            document.querySelectorAll('.filter-group:nth-child(2) .filter-btn').forEach(btn => {
                 if (btn.textContent.toLowerCase() === severity.toLowerCase() ||
                     (btn.textContent === 'All' && severity === 'all')) {
                     btn.classList.add('active');
-                } else if (!btn.onclick.toString().includes('filterByType')) {
+                } else {
                     btn.classList.remove('active');
                 }
             });
@@ -1482,6 +2148,24 @@ Respond in JSON format:
             } else {
                 currentTypeFilter = type;
             }
+
+            applyFilters();
+        }
+
+        function filterByTool(tool) {
+            currentToolFilter = tool;
+
+            // Update button states for tool filter
+            ['all', 'trufflehog', 'gitleaks', 'both'].forEach(t => {
+                const btn = document.getElementById('tool-' + t);
+                if (btn) {
+                    if (t === tool) {
+                        btn.classList.add('active');
+                    } else {
+                        btn.classList.remove('active');
+                    }
+                }
+            });
 
             applyFilters();
         }
@@ -1510,6 +2194,11 @@ Respond in JSON format:
                     show = show && card.dataset.falsePositive !== 'true';
                 } else if (currentTypeFilter === 'needs_review') {
                     show = show && card.dataset.needsReview === 'true';
+                }
+
+                // Tool filter
+                if (currentToolFilter !== 'all') {
+                    show = show && card.dataset.tool === currentToolFilter;
                 }
 
                 // Search filter

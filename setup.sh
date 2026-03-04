@@ -55,30 +55,80 @@ echo ""
 echo -e "${BLUE}📦 Installing Python dependencies...${NC}"
 pip3 install -r requirements.txt
 
+# Check Git
+echo ""
+echo -e "${BLUE}🔍 Checking for Git...${NC}"
+if ! command -v git &> /dev/null; then
+    echo -e "${RED}❌ Git is not installed!${NC}"
+    echo "Git is required for cloning repositories."
+    echo ""
+    echo "Installation options:"
+    echo "  Linux:   sudo apt install git"
+    echo "  macOS:   brew install git"
+    exit 1
+else
+    GIT_VERSION=$(git --version 2>&1 || echo "unknown")
+    echo -e "${GREEN}✓ Git detected: ${GIT_VERSION}${NC}"
+fi
+
 # Check TruffleHog
 echo ""
 echo -e "${BLUE}🔍 Checking for TruffleHog...${NC}"
 if ! command -v trufflehog &> /dev/null; then
     echo -e "${YELLOW}⚠️  TruffleHog not found!${NC}"
     echo ""
-    echo "TruffleHog is required for deep repository scanning."
+    echo "TruffleHog v3.x is used for deep repository scanning."
     echo ""
     echo "Installation options:"
-    echo "  1. macOS:        brew install trufflehog"
-    echo "  2. Python:       pip install trufflehog"
-    echo "  3. Binary:       https://github.com/trufflesecurity/trufflehog/releases"
+    echo "  1. macOS:  brew install trufflehog"
+    echo "  2. Linux:  Download binary from releases"
     echo ""
-    read -p "Would you like to install via pip? (y/n): " install_trufflehog
+    read -p "Would you like to install TruffleHog v3.x binary? (y/n): " install_trufflehog
 
     if [[ $install_trufflehog =~ ^[Yy]$ ]]; then
-        pip3 install trufflehog
-        echo -e "${GREEN}✓ TruffleHog installed${NC}"
+        TRUFFLEHOG_VERSION="3.63.7"
+        echo -e "${BLUE}Downloading TruffleHog v${TRUFFLEHOG_VERSION}...${NC}"
+        wget -q "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz" -O /tmp/trufflehog.tar.gz
+        tar -xzf /tmp/trufflehog.tar.gz -C /tmp
+        sudo mv /tmp/trufflehog /usr/local/bin/
+        rm /tmp/trufflehog.tar.gz
+        echo -e "${GREEN}✓ TruffleHog v${TRUFFLEHOG_VERSION} installed${NC}"
     else
-        echo -e "${YELLOW}⚠️  Skipping TruffleHog installation (required for Repo Scan feature)${NC}"
+        echo -e "${YELLOW}⚠️  Skipping TruffleHog installation (optional for Repo Scan)${NC}"
     fi
 else
     TRUFFLEHOG_VERSION=$(trufflehog --version 2>&1 || echo "unknown")
     echo -e "${GREEN}✓ TruffleHog detected: ${TRUFFLEHOG_VERSION}${NC}"
+fi
+
+# Check Gitleaks
+echo ""
+echo -e "${BLUE}🔍 Checking for Gitleaks...${NC}"
+if ! command -v gitleaks &> /dev/null; then
+    echo -e "${YELLOW}⚠️  Gitleaks not found!${NC}"
+    echo ""
+    echo "Gitleaks is used for comprehensive secret scanning."
+    echo ""
+    echo "Installation options:"
+    echo "  1. macOS:  brew install gitleaks"
+    echo "  2. Linux:  Download binary from releases"
+    echo ""
+    read -p "Would you like to install Gitleaks binary? (y/n): " install_gitleaks
+
+    if [[ $install_gitleaks =~ ^[Yy]$ ]]; then
+        GITLEAKS_VERSION="8.18.2"
+        echo -e "${BLUE}Downloading Gitleaks v${GITLEAKS_VERSION}...${NC}"
+        wget -q "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -O /tmp/gitleaks.tar.gz
+        tar -xzf /tmp/gitleaks.tar.gz -C /tmp
+        sudo mv /tmp/gitleaks /usr/local/bin/
+        rm /tmp/gitleaks.tar.gz
+        echo -e "${GREEN}✓ Gitleaks v${GITLEAKS_VERSION} installed${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Skipping Gitleaks installation (optional for Repo Scan)${NC}"
+    fi
+else
+    GITLEAKS_VERSION=$(gitleaks version 2>&1 || echo "unknown")
+    echo -e "${GREEN}✓ Gitleaks detected: ${GITLEAKS_VERSION}${NC}"
 fi
 
 # Setup .env file
@@ -176,10 +226,16 @@ echo -e "${GREEN}╚════════════════════
 echo ""
 echo -e "${BLUE}📋 Setup Summary:${NC}"
 echo -e "   ✓ Python dependencies installed"
+echo -e "   ✓ Git installed"
 if command -v trufflehog &> /dev/null; then
     echo -e "   ✓ TruffleHog installed"
 else
-    echo -e "   ⚠️  TruffleHog not installed (install manually for Repo Scan)"
+    echo -e "   ⚠️  TruffleHog not installed (optional - install for TruffleHog scanning)"
+fi
+if command -v gitleaks &> /dev/null; then
+    echo -e "   ✓ Gitleaks installed"
+else
+    echo -e "   ⚠️  Gitleaks not installed (optional - install for Gitleaks scanning)"
 fi
 echo -e "   ✓ Environment file created (.env)"
 echo -e "   ✓ Output directory created (outputs/)"
