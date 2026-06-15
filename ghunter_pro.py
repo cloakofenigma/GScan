@@ -27,6 +27,7 @@ import signal
 import subprocess
 import shutil
 import re
+import html
 import hashlib
 from datetime import datetime
 from pathlib import Path
@@ -69,8 +70,12 @@ class Config:
     base_url: str = "https://api.github.com/search/code"
     rate_limit: int = 10  # requests per minute
     max_concurrent: int = 5
+    max_pages: int = 10  # GitHub code search caps results at 1000 (10 pages x 100)
     timeout: int = 30
     retry_attempts: int = 3
+    # Privacy: when False, secret values are stripped before sending findings to
+    # the Gemini AI for triage. Set True to opt in to sending raw data off-host.
+    ai_send_raw: bool = False
     valid_extensions: Set[str] = None
     output_base_dir: Path = Path("outputs")
     # Gitleaks integration settings
@@ -787,56 +792,102 @@ For issues, questions, or contributions:
             await self.session.close()
             await asyncio.sleep(0.1)
 
+    def _rate_limit_wait(self, response) -> int:
+        """Compute how long to back off on a 403/429 using GitHub headers."""
+        # Retry-After (seconds) is used for secondary/abuse rate limits
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(1, int(retry_after))
+            except ValueError:
+                pass
+        # Fall back to X-RateLimit-Reset (epoch seconds) when the budget is spent
+        reset = response.headers.get("X-RateLimit-Reset")
+        remaining = response.headers.get("X-RateLimit-Remaining")
+        if reset and remaining == "0":
+            try:
+                wait = int(reset) - int(time.time())
+                if wait > 0:
+                    return min(wait + 1, 120)
+            except ValueError:
+                pass
+        return 60
+
     async def search_github(self, keyword: str, dork: str) -> Tuple[Set[str], Set[str]]:
-        """Search GitHub with retry logic"""
+        """Search GitHub with retry logic and pagination.
+
+        The code-search API returns at most 100 results per page and 1000
+        results total (10 pages). We page through results until a short page is
+        returned, the per-query cap is reached, or an error stops us.
+        """
         async with self.semaphore:
             query = f"{keyword} {dork}"
             repos, urls = set(), set()
+            per_page = 100
 
-            for attempt in range(self.config.retry_attempts):
-                try:
-                    params = {"q": query, "per_page": 100}
+            for page in range(1, self.config.max_pages + 1):
+                if self.shutdown_event.is_set():
+                    break
 
-                    async with self.session.get(self.config.base_url, params=params) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            items = data.get("items", [])
+                page_items = None  # None = page could not be fetched
 
-                            for item in items:
-                                repo_url = item["repository"]["html_url"]
-                                file_url = item["html_url"]
+                for attempt in range(self.config.retry_attempts):
+                    try:
+                        params = {"q": query, "per_page": per_page, "page": page}
 
-                                # Append .git suffix for clone compatibility
-                                if not repo_url.endswith(".git"):
-                                    repo_url = repo_url + ".git"
-                                repos.add(repo_url)
+                        async with self.session.get(self.config.base_url, params=params) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                page_items = data.get("items", [])
+                                break
 
-                                # Check file extension
-                                if any(file_url.lower().endswith(ext) for ext in self.config.valid_extensions):
-                                    urls.add(file_url)
+                            elif response.status in (403, 429):
+                                wait = self._rate_limit_wait(response)
+                                self.logger.warning(f"Rate limit hit for '{query}', waiting {wait}s...")
+                                await asyncio.sleep(wait)
+                                continue
 
-                            break
+                            elif response.status == 422:
+                                # Invalid query, or paging past the 1000-result cap
+                                self.logger.debug(f"422 for '{query}' page {page} (end of results)")
+                                page_items = []
+                                break
 
-                        elif response.status == 403:
-                            self.logger.warning(f"Rate limit hit for '{query}', waiting 60s...")
-                            await asyncio.sleep(60)
-                            continue
+                            else:
+                                self.logger.error(f"HTTP {response.status} for '{query}'")
 
-                        elif response.status == 422:
-                            self.logger.error(f"Invalid query '{query}', skipping")
-                            break
-
+                    except Exception as e:
+                        self.logger.error(f"Attempt {attempt + 1} failed for '{query}': {e}")
+                        if attempt < self.config.retry_attempts - 1:
+                            await asyncio.sleep(2 ** attempt)
                         else:
-                            self.logger.error(f"HTTP {response.status} for '{query}'")
+                            self.progress.errors += 1
 
-                except Exception as e:
-                    self.logger.error(f"Attempt {attempt + 1} failed for '{query}': {e}")
-                    if attempt < self.config.retry_attempts - 1:
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        self.progress.errors += 1
+                # Could not fetch this page after all retries -> stop paging
+                if page_items is None:
+                    break
 
-            # Rate limiting
+                for item in page_items:
+                    repo_url = item["repository"]["html_url"]
+                    file_url = item["html_url"]
+
+                    # Append .git suffix for clone compatibility
+                    if not repo_url.endswith(".git"):
+                        repo_url = repo_url + ".git"
+                    repos.add(repo_url)
+
+                    # Check file extension
+                    if any(file_url.lower().endswith(ext) for ext in self.config.valid_extensions):
+                        urls.add(file_url)
+
+                # Last page reached (short or empty page)
+                if len(page_items) < per_page:
+                    break
+
+                # Throttle between pages of the same query
+                await asyncio.sleep(60 / self.config.rate_limit)
+
+            # Throttle between queries
             await asyncio.sleep(60 / self.config.rate_limit)
             return repos, urls
 
@@ -979,6 +1030,35 @@ For issues, questions, or contributions:
         print(f"  • {repos_file_path}")
         print(f"  • {urls_file_path}\n")
 
+    # Keys in scanner JSON output that may carry the actual secret value
+    _SECRET_KEYS = {"Raw", "RawV2", "Redacted", "Secret", "Match", "Line"}
+
+    def _ai_context(self, finding: SecretFinding) -> str:
+        """Build the finding context sent to the AI.
+
+        By default the raw secret value is stripped so credentials never leave
+        the host. Set ai_send_raw=True in Config to opt in to sending raw data.
+        """
+        if self.config.ai_send_raw:
+            return finding.raw_result[:500]
+
+        try:
+            data = json.loads(finding.raw_result)
+        except (json.JSONDecodeError, TypeError):
+            return "[raw data redacted]"
+
+        def scrub(obj):
+            if isinstance(obj, dict):
+                return {
+                    k: ("[REDACTED]" if k in self._SECRET_KEYS else scrub(v))
+                    for k, v in obj.items()
+                }
+            if isinstance(obj, list):
+                return [scrub(v) for v in obj]
+            return obj
+
+        return json.dumps(scrub(data))[:500]
+
     async def analyze_with_gemini(self, finding: SecretFinding) -> Dict:
         """Analyze finding with Google Gemini AI"""
         if not self.gemini_model:
@@ -990,6 +1070,7 @@ For issues, questions, or contributions:
             }
 
         try:
+            ai_context = self._ai_context(finding)
             prompt = f"""Analyze this potential secret finding and determine:
 1. Is this a FALSE POSITIVE? (test data, example, placeholder, etc.)
 2. Does it need MANUAL REVIEW?
@@ -1003,8 +1084,8 @@ Finding Details:
 - Repository: {finding.repo_url}
 - File: {finding.file_path}
 
-Raw Data:
-{finding.raw_result[:500]}
+Metadata (secret value redacted):
+{ai_context}
 
 Respond in JSON format:
 {{
@@ -1467,138 +1548,145 @@ Respond in JSON format:
         clone_dir = output_dir / self.config.clone_dir
         clone_dir.mkdir(parents=True, exist_ok=True)
 
-        # Reset progress for this scan
-        self.progress = ScanProgress()
-        self.progress.scan_tool = scan_tool
-        self.progress.start_time = time.time()
-
-        # Prepare output files
+        # Output file
         results_file = output_dir / "scan_results.json"
-        trufflehog_raw_file = output_dir / "trufflehog_raw.json"
-        gitleaks_raw_file = output_dir / "gitleaks_raw.json"
 
-        all_findings: List[SecretFinding] = []
+        # Resume support: reuse prior progress + results when a checkpoint exists
+        progress_file = output_dir / "progress.json"
+        resume = False
+        if progress_file.exists():
+            resume_input = input(
+                f"{Fore.YELLOW}Previous repo scan found. Resume? (y/n):{Style.RESET_ALL} "
+            ).strip().lower()
+            resume = resume_input == 'y'
+
+        if resume:
+            self.progress = self.load_progress(output_dir)
+            print(f"{Fore.GREEN}Resuming repo scan... "
+                  f"({len(self.progress.scanned_repos)} repos already scanned){Style.RESET_ALL}")
+        else:
+            self.progress = ScanProgress()
+            self.progress.start_time = time.time()
+        self.progress.scan_tool = scan_tool
+
+        # Append when resuming so previously-written findings are preserved
+        results_mode = 'a' if resume else 'w'
 
         print(f"\n{Fore.YELLOW}Starting {scan_tool.upper()} scan of {len(repos)} repositories...{Style.RESET_ALL}")
         print(f"Clone directory: {clone_dir}")
         print(f"Output directory: {output_dir}\n")
 
-        with tqdm(total=len(repos), desc="Scanning repos") as pbar:
-            for repo_url in repos:
-                if self.shutdown_event.is_set():
-                    print(f"\n{Fore.YELLOW}Scan interrupted. Cleaning up...{Style.RESET_ALL}")
-                    break
+        def serialize(finding: SecretFinding) -> str:
+            return json.dumps({
+                'detector_type': finding.detector_type,
+                'detector_name': finding.detector_name,
+                'verified': finding.verified,
+                'repo_url': finding.repo_url,
+                'file_path': finding.file_path,
+                'commit': finding.commit,
+                'timestamp': finding.timestamp,
+                'severity': finding.severity,
+                'false_positive': finding.false_positive,
+                'needs_review': finding.needs_review,
+                'ai_analysis': finding.ai_analysis,
+                'raw_result': finding.raw_result,
+                'scan_tool': finding.scan_tool,
+                'found_by': finding.found_by
+            })
 
-                # Skip if already scanned (for resume capability)
-                if repo_url in self.progress.scanned_repos:
-                    pbar.update(1)
-                    continue
+        # Keep the results file open for the whole scan and flush per-repo so an
+        # interrupted run can be resumed without losing completed work.
+        with open(results_file, results_mode) as results_out:
+            with tqdm(total=len(repos), initial=len(self.progress.scanned_repos),
+                      desc="Scanning repos") as pbar:
+                for repo_url in repos:
+                    if self.shutdown_event.is_set():
+                        print(f"\n{Fore.YELLOW}Scan interrupted. Progress saved - resume to continue.{Style.RESET_ALL}")
+                        break
 
-                repo_name = self.get_repo_name_from_url(repo_url)
-                pbar.set_description(f"Cloning {repo_name}")
+                    # Skip if already scanned (resume)
+                    if repo_url in self.progress.scanned_repos:
+                        pbar.update(1)
+                        continue
 
-                # Clone repository
-                success, clone_path = self.clone_repository(repo_url, clone_dir)
+                    repo_name = self.get_repo_name_from_url(repo_url)
+                    pbar.set_description(f"Cloning {repo_name}")
 
-                if not success:
-                    self.progress.clone_failures += 1
-                    self.progress.errors += 1
-                    pbar.update(1)
-                    pbar.set_postfix({'Errors': self.progress.errors, 'Secrets': self.progress.secrets_found})
-                    continue
+                    # Clone repository
+                    success, clone_path = self.clone_repository(repo_url, clone_dir)
 
-                # Track current clone for cleanup on interrupt
-                self._current_clone_path = clone_path
+                    if not success:
+                        self.progress.clone_failures += 1
+                        self.progress.errors += 1
+                        self.save_progress(output_dir)
+                        pbar.update(1)
+                        pbar.set_postfix({'Errors': self.progress.errors, 'Secrets': self.progress.secrets_found})
+                        continue
 
-                repo_findings = []
+                    # Track current clone for cleanup on interrupt
+                    self._current_clone_path = clone_path
 
-                try:
-                    # Run selected tool(s)
-                    if scan_tool in ["trufflehog", "both"] and trufflehog_available:
-                        pbar.set_description(f"TruffleHog: {repo_name}")
-                        tf_findings = self.run_trufflehog_local(clone_path, repo_url)
-                        repo_findings.extend(tf_findings)
+                    repo_findings = []
 
-                    if scan_tool in ["gitleaks", "both"] and gitleaks_available:
-                        pbar.set_description(f"Gitleaks: {repo_name}")
-                        gl_output = clone_dir / f"{repo_name}_gitleaks.json"
-                        gl_findings = self.run_gitleaks_local(clone_path, repo_url, gl_output)
-                        repo_findings.extend(gl_findings)
-                        # Cleanup gitleaks output file
-                        if gl_output.exists():
-                            gl_output.unlink()
+                    try:
+                        # Run selected tool(s)
+                        if scan_tool in ["trufflehog", "both"] and trufflehog_available:
+                            pbar.set_description(f"TruffleHog: {repo_name}")
+                            tf_findings = self.run_trufflehog_local(clone_path, repo_url)
+                            repo_findings.extend(tf_findings)
 
-                    # Update progress
+                        if scan_tool in ["gitleaks", "both"] and gitleaks_available:
+                            pbar.set_description(f"Gitleaks: {repo_name}")
+                            gl_output = clone_dir / f"{repo_name}_gitleaks.json"
+                            gl_findings = self.run_gitleaks_local(clone_path, repo_url, gl_output)
+                            repo_findings.extend(gl_findings)
+                            # Cleanup gitleaks output file
+                            if gl_output.exists():
+                                gl_output.unlink()
+                    finally:
+                        # Always cleanup clone
+                        pbar.set_description(f"Cleanup: {repo_name}")
+                        self.cleanup_clone(clone_path)
+                        self._current_clone_path = None
+
+                    # Deduplicate this repo's findings when both tools ran
+                    # (the dedup key includes repo_url, so per-repo == global)
+                    if scan_tool == "both" and repo_findings:
+                        repo_findings = self.deduplicate_findings(repo_findings)
+
+                    # AI analysis per-repo so resumed runs keep analyzed results
+                    if self.gemini_model and repo_findings:
+                        for finding in repo_findings:
+                            if self.shutdown_event.is_set():
+                                break
+                            analysis = await self.analyze_with_gemini(finding)
+                            finding.ai_analysis = analysis
+                            finding.false_positive = analysis.get('false_positive', False)
+                            finding.needs_review = analysis.get('needs_review', False)
+                            finding.severity = analysis.get('severity', 'UNKNOWN')
+                            if finding.false_positive:
+                                self.progress.false_positives += 1
+                            if finding.needs_review:
+                                self.progress.needs_manual_review += 1
+                            time.sleep(0.5)  # Rate limit Gemini API
+
+                    # Update counters and persist findings for this repo
                     for finding in repo_findings:
                         self.progress.secrets_found += 1
                         if finding.verified:
                             self.progress.verified_secrets += 1
+                        results_out.write(serialize(finding) + '\n')
+                    results_out.flush()
 
-                    all_findings.extend(repo_findings)
-
-                finally:
-                    # Always cleanup clone
-                    pbar.set_description(f"Cleanup: {repo_name}")
-                    self.cleanup_clone(clone_path)
-                    self._current_clone_path = None
-
-                # Mark repo as scanned
-                self.progress.scanned_repos.add(repo_url)
-
-                pbar.update(1)
-                pbar.set_postfix({
-                    'Secrets': self.progress.secrets_found,
-                    'Errors': self.progress.errors
-                })
-
-        # Deduplicate findings if both tools were used
-        if scan_tool == "both" and len(all_findings) > 0:
-            print(f"\n{Fore.CYAN}Deduplicating {len(all_findings)} findings...{Style.RESET_ALL}")
-            all_findings = self.deduplicate_findings(all_findings)
-            print(f"{Fore.GREEN}✓ {len(all_findings)} unique findings after deduplication{Style.RESET_ALL}")
-
-        # AI Analysis if Gemini available
-        if self.gemini_model and all_findings:
-            print(f"\n{Fore.YELLOW}Running AI analysis on {len(all_findings)} findings...{Style.RESET_ALL}\n")
-
-            with tqdm(total=len(all_findings), desc="AI Analysis") as pbar:
-                for finding in all_findings:
-                    if self.shutdown_event.is_set():
-                        break
-
-                    analysis = await self.analyze_with_gemini(finding)
-                    finding.ai_analysis = analysis
-                    finding.false_positive = analysis.get('false_positive', False)
-                    finding.needs_review = analysis.get('needs_review', False)
-                    finding.severity = analysis.get('severity', 'UNKNOWN')
-
-                    if finding.false_positive:
-                        self.progress.false_positives += 1
-                    if finding.needs_review:
-                        self.progress.needs_manual_review += 1
+                    # Mark repo as scanned and checkpoint
+                    self.progress.scanned_repos.add(repo_url)
+                    self.save_progress(output_dir)
 
                     pbar.update(1)
-                    time.sleep(0.5)  # Rate limit Gemini API
-
-        # Save results
-        with open(results_file, 'w') as f:
-            for finding in all_findings:
-                f.write(json.dumps({
-                    'detector_type': finding.detector_type,
-                    'detector_name': finding.detector_name,
-                    'verified': finding.verified,
-                    'repo_url': finding.repo_url,
-                    'file_path': finding.file_path,
-                    'commit': finding.commit,
-                    'timestamp': finding.timestamp,
-                    'severity': finding.severity,
-                    'false_positive': finding.false_positive,
-                    'needs_review': finding.needs_review,
-                    'ai_analysis': finding.ai_analysis,
-                    'raw_result': finding.raw_result,
-                    'scan_tool': finding.scan_tool,
-                    'found_by': finding.found_by
-                }) + '\n')
+                    pbar.set_postfix({
+                        'Secrets': self.progress.secrets_found,
+                        'Errors': self.progress.errors
+                    })
 
         # Cleanup clones directory if empty
         try:
@@ -1607,11 +1695,19 @@ Respond in JSON format:
         except:
             pass
 
-        # Calculate statistics
+        # Calculate statistics from the full results file (covers resumed runs)
         elapsed_time = time.time() - self.progress.start_time
-        found_by_trufflehog = sum(1 for f in all_findings if 'trufflehog' in f.found_by)
-        found_by_gitleaks = sum(1 for f in all_findings if 'gitleaks' in f.found_by)
-        found_by_both = sum(1 for f in all_findings if len(f.found_by) > 1)
+        persisted = []
+        if results_file.exists():
+            with open(results_file, 'r') as rf:
+                for line in rf:
+                    try:
+                        persisted.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        found_by_trufflehog = sum(1 for f in persisted if 'trufflehog' in f.get('found_by', []))
+        found_by_gitleaks = sum(1 for f in persisted if 'gitleaks' in f.get('found_by', []))
+        found_by_both = sum(1 for f in persisted if len(f.get('found_by', [])) > 1)
 
         # Display results
         print(f"\n{Fore.GREEN}╔══════════════════════════════════════════════════════════════╗")
@@ -2025,9 +2121,28 @@ Respond in JSON format:
 
         # Add finding cards
         for idx, finding in enumerate(findings):
-            severity = finding.get('severity', 'UNKNOWN').lower()
+            # All values below originate from scanned repos / secret contents and
+            # are attacker-influenced, so escape every field before embedding it
+            # in HTML to prevent stored XSS in the report.
+            severity_raw = str(finding.get('severity', 'UNKNOWN'))
+            severity = html.escape(severity_raw.lower(), quote=True)
+            severity_text = html.escape(severity_raw)
             verified_badge = 'badge-verified' if finding.get('verified') else 'badge-unverified'
             verified_text = 'Verified' if finding.get('verified') else 'Unverified'
+
+            detector_name = html.escape(str(finding.get('detector_name', 'Unknown Detector')))
+            detector_type = html.escape(str(finding.get('detector_type', 'Unknown Type')))
+            file_path = html.escape(str(finding.get('file_path', 'N/A')))
+            commit = html.escape(str(finding.get('commit', 'N/A')))
+            timestamp = html.escape(str(finding.get('timestamp', 'N/A')))
+
+            # Only allow http(s) links; everything else (e.g. javascript:) -> '#'
+            repo_url_raw = finding.get('repo_url', '')
+            if isinstance(repo_url_raw, str) and repo_url_raw.startswith(('https://', 'http://')):
+                repo_url_href = html.escape(repo_url_raw, quote=True)
+            else:
+                repo_url_href = '#'
+            repo_url_text = html.escape(str(repo_url_raw) if repo_url_raw else 'N/A')
 
             # Determine scan tool for badge and filtering
             found_by = finding.get('found_by', [])
@@ -2051,7 +2166,7 @@ Respond in JSON format:
 
             badges_html = f'<span class="badge badge-tool {tool_class}">{tool_text}</span>'
             badges_html += f'<span class="badge {verified_badge}">{verified_text}</span>'
-            badges_html += f'<span class="badge badge-severity {severity}">{finding.get("severity", "UNKNOWN")}</span>'
+            badges_html += f'<span class="badge badge-severity {severity}">{severity_text}</span>'
 
             if finding.get('false_positive'):
                 badges_html += '<span class="badge badge-false-positive">False Positive</span>'
@@ -2065,7 +2180,7 @@ Respond in JSON format:
                 ai_analysis_html = f"""
                 <div class="ai-analysis">
                     <div class="ai-analysis-title">🤖 AI Analysis</div>
-                    <p><strong>Assessment:</strong> {ai.get('reason', 'N/A')}</p>
+                    <p><strong>Assessment:</strong> {html.escape(str(ai.get('reason', 'N/A')))}</p>
                 </div>
                 """
 
@@ -2076,7 +2191,7 @@ Respond in JSON format:
                  data-tool="{tool_data}">
                 <div class="finding-header" onclick="toggleFinding({idx})">
                     <div class="finding-title">
-                        {finding.get('detector_name', 'Unknown Detector')} - {finding.get('detector_type', 'Unknown Type')}
+                        {detector_name} - {detector_type}
                     </div>
                     <div class="finding-badges">
                         {badges_html}
@@ -2086,20 +2201,20 @@ Respond in JSON format:
                     <div class="finding-detail">
                         <div class="finding-detail-label">Repository</div>
                         <div class="finding-detail-value">
-                            <a href="{finding.get('repo_url', '#')}" target="_blank">{finding.get('repo_url', 'N/A')}</a>
+                            <a href="{repo_url_href}" target="_blank" rel="noopener noreferrer">{repo_url_text}</a>
                         </div>
                     </div>
                     <div class="finding-detail">
                         <div class="finding-detail-label">File Path</div>
-                        <div class="finding-detail-value">{finding.get('file_path', 'N/A')}</div>
+                        <div class="finding-detail-value">{file_path}</div>
                     </div>
                     <div class="finding-detail">
                         <div class="finding-detail-label">Commit</div>
-                        <div class="finding-detail-value">{finding.get('commit', 'N/A')}</div>
+                        <div class="finding-detail-value">{commit}</div>
                     </div>
                     <div class="finding-detail">
                         <div class="finding-detail-label">Timestamp</div>
-                        <div class="finding-detail-value">{finding.get('timestamp', 'N/A')}</div>
+                        <div class="finding-detail-value">{timestamp}</div>
                     </div>
                     {ai_analysis_html}
                 </div>
