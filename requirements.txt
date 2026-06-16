@@ -1,14 +1,19 @@
 # G-Hunter Dependencies
 # Install with: pip install -r requirements.txt
 
-# Core dependencies
-aiohttp>=3.9.0
-python-dotenv>=1.0.0
-tqdm>=4.66.0
-colorama>=0.4.6
+# Core dependencies (also declared in pyproject.toml)
+aiohttp>=3.9.0,<4
+python-dotenv>=1.0.0,<2
+tqdm>=4.66.0,<5
+colorama>=0.4.6,<1
 
-# AI Analysis (optional but recommended)
+# AI Analysis (optional but recommended). Also available via: pip install -e ".[ai]"
+# The tool degrades gracefully and skips AI triage if this is not installed.
 google-generativeai>=0.3.0
+
+# Dev/test (or: pip install -e ".[dev]")
+# pytest>=7.4
+# pytest-asyncio>=0.23
 
 # Note: TruffleHog must be installed separately
 # Installation: https://github.com/trufflesecurity/trufflehog

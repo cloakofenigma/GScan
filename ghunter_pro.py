@@ -29,30 +29,38 @@ import shutil
 import re
 import html
 import hashlib
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List, Set, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict, field
 from concurrent.futures import ThreadPoolExecutor
 
-# Third-party imports with auto-install
+# Third-party imports. We do NOT auto-run `pip install` on import: silently
+# mutating the user's environment is surprising and a security/supply-chain
+# footgun. Instead we fail fast with clear remediation instructions.
 try:
     from tqdm import tqdm
     import colorama
     from colorama import Fore, Back, Style
     from dotenv import load_dotenv
-    import google.generativeai as genai
 except ImportError as e:
-    print(f"Installing required dependencies...")
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install",
-        "tqdm", "colorama", "aiohttp", "python-dotenv", "google-generativeai"
-    ])
-    from tqdm import tqdm
-    import colorama
-    from colorama import Fore, Back, Style
-    from dotenv import load_dotenv
+    missing = getattr(e, "name", None) or str(e)
+    sys.stderr.write(
+        f"\nMissing required dependency: {missing}\n"
+        "Install project dependencies first:\n"
+        "    pip install -r requirements.txt\n"
+        "(or: pip install -e .)\n\n"
+    )
+    sys.exit(1)
+
+# Gemini is optional; degrade gracefully if it is not installed.
+try:
     import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    genai = None
+    GENAI_AVAILABLE = False
 
 # Initialize colorama
 colorama.init(autoreset=True)
@@ -70,6 +78,7 @@ class Config:
     base_url: str = "https://api.github.com/search/code"
     rate_limit: int = 10  # requests per minute
     max_concurrent: int = 5
+    max_repo_workers: int = 3  # concurrent clone+scan workers in repo scan
     max_pages: int = 10  # GitHub code search caps results at 1000 (10 pages x 100)
     timeout: int = 30
     retry_attempts: int = 3
@@ -178,18 +187,26 @@ class GHunter:
         self.session: Optional[aiohttp.ClientSession] = None
         self.semaphore: Optional[asyncio.Semaphore] = None
         self.shutdown_event = asyncio.Event()
+        # Track in-progress clones (multiple under concurrency) for interrupt cleanup
+        self._active_clone_paths: Set[Path] = set()
+        self._clone_lock = threading.Lock()
         self.logger = self.setup_logging()
         self.setup_signal_handlers()
         self.gemini_model = None
 
-        # Initialize Gemini if API key available
-        if self.config.gemini_api_key:
+        # Initialize Gemini if API key available and the SDK is installed
+        if self.config.gemini_api_key and GENAI_AVAILABLE:
             try:
                 genai.configure(api_key=self.config.gemini_api_key)
                 self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
                 self.logger.info("Google Gemini AI initialized successfully")
             except Exception as e:
                 self.logger.warning(f"Failed to initialize Gemini: {e}")
+        elif self.config.gemini_api_key and not GENAI_AVAILABLE:
+            self.logger.warning(
+                "GEMINI_API_KEY set but google-generativeai is not installed; "
+                "skipping AI analysis. Install with: pip install google-generativeai"
+            )
 
     def setup_logging(self) -> logging.Logger:
         """Setup comprehensive logging"""
@@ -209,18 +226,27 @@ class GHunter:
             self.logger.info("Received shutdown signal. Cleaning up...")
             self.shutdown_event.set()
 
-            # Cleanup any in-progress clone
-            if hasattr(self, '_current_clone_path') and self._current_clone_path:
+            # Cleanup all in-progress clones (there may be several concurrently)
+            with self._clone_lock:
+                paths = list(self._active_clone_paths)
+            for path in paths:
                 try:
-                    if self._current_clone_path.exists():
-                        self.logger.info(f"Cleaning up interrupted clone: {self._current_clone_path}")
-                        shutil.rmtree(self._current_clone_path)
-                        self._current_clone_path = None
+                    if path.exists():
+                        self.logger.info(f"Cleaning up interrupted clone: {path}")
+                        shutil.rmtree(path)
                 except Exception as e:
                     self.logger.error(f"Failed to cleanup clone on interrupt: {e}")
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
+
+    def _register_clone(self, path: Path):
+        with self._clone_lock:
+            self._active_clone_paths.add(path)
+
+    def _unregister_clone(self, path: Path):
+        with self._clone_lock:
+            self._active_clone_paths.discard(path)
 
     def display_menu(self):
         """Display main menu"""
@@ -718,6 +744,19 @@ For issues, questions, or contributions:
 
         return ScanProgress()
 
+    # Accept only plain http(s) git URLs. This blocks argument injection
+    # (e.g. a repos.txt line starting with '-' or '--upload-pack=...') and
+    # non-network schemes (file://, ssh://, ext::) from reaching git/scanners.
+    _REPO_URL_RE = re.compile(r'^https?://[A-Za-z0-9._~:/?#\[\]@!$&\'()*+,;=%-]+$')
+
+    def is_valid_repo_url(self, repo_url: str) -> bool:
+        """Validate a repository URL before passing it to a subprocess."""
+        if not isinstance(repo_url, str) or not repo_url:
+            return False
+        if repo_url.startswith('-'):  # never let a URL look like a CLI flag
+            return False
+        return bool(self._REPO_URL_RE.match(repo_url))
+
     def get_repo_name_from_url(self, repo_url: str) -> str:
         """Extract repository name from URL"""
         # Handle URLs like https://github.com/username/reponame.git
@@ -728,6 +767,11 @@ For issues, questions, or contributions:
 
     def clone_repository(self, repo_url: str, clone_dir: Path) -> Tuple[bool, Optional[Path]]:
         """Clone a repository to the specified directory"""
+        # Reject anything that isn't a plain http(s) URL before it reaches git
+        if not self.is_valid_repo_url(repo_url):
+            self.logger.error(f"Refusing to clone invalid/unsafe repo URL: {repo_url!r}")
+            return False, None
+
         repo_name = self.get_repo_name_from_url(repo_url)
         clone_path = clone_dir / repo_name
 
@@ -738,7 +782,8 @@ For issues, questions, or contributions:
         try:
             self.logger.info(f"Cloning {repo_url} to {clone_path}")
             result = subprocess.run(
-                ['git', 'clone', '--quiet', repo_url, str(clone_path)],
+                # '--' ensures repo_url is treated as a positional, never a flag
+                ['git', 'clone', '--quiet', '--', repo_url, str(clone_path)],
                 capture_output=True,
                 text=True,
                 timeout=300  # 5 minute timeout for clone
@@ -771,9 +816,6 @@ For issues, questions, or contributions:
                 self.logger.debug(f"Cleaned up {clone_path}")
         except Exception as e:
             self.logger.error(f"Failed to cleanup {clone_path}: {e}")
-
-    # Track current clone path for cleanup on interrupt
-    _current_clone_path: Optional[Path] = None
 
     async def create_session(self):
         """Create async HTTP session"""
@@ -891,22 +933,30 @@ For issues, questions, or contributions:
             await asyncio.sleep(60 / self.config.rate_limit)
             return repos, urls
 
-    async def git_scan(self):
-        """Main Git scan functionality"""
+    async def git_scan(self, keywords: Optional[List[str]] = None,
+                        dorks_file: Optional[str] = None,
+                        resume: Optional[bool] = None):
+        """Main Git scan functionality.
+
+        When called with no arguments the parameters are gathered interactively;
+        when arguments are supplied (non-interactive/CLI mode) prompts are skipped.
+        """
+        interactive = keywords is None
         print(f"\n{Fore.CYAN}╔══════════════════════════════════════════════════════════════╗")
         print(f"║            Git Scan - GitHub Dorking Search                 ║")
         print(f"╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}\n")
 
-        # Get user input
-        keywords_input = input(f"{Fore.GREEN}Enter keywords (comma-separated):{Style.RESET_ALL} ").strip()
-        if not keywords_input:
+        # Keywords
+        if keywords is None:
+            keywords_input = input(f"{Fore.GREEN}Enter keywords (comma-separated):{Style.RESET_ALL} ").strip()
+            keywords = [k.strip() for k in keywords_input.split(",") if k.strip()]
+        if not keywords:
             print(f"{Fore.RED}Error: No keywords provided!{Style.RESET_ALL}")
             return
 
-        keywords = [k.strip() for k in keywords_input.split(",") if k.strip()]
-
-        # Get dorks file
-        dorks_file = input(f"{Fore.GREEN}Enter path to git dorks file (default: gitDorks.txt):{Style.RESET_ALL} ").strip()
+        # Dorks file
+        if dorks_file is None:
+            dorks_file = input(f"{Fore.GREEN}Enter path to git dorks file (default: gitDorks.txt):{Style.RESET_ALL} ").strip()
         if not dorks_file:
             dorks_file = "gitDorks.txt"
 
@@ -925,12 +975,13 @@ For issues, questions, or contributions:
         output_dir = self.config.output_base_dir / first_keyword
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Ask about resume
-        resume = False
+        # Resume handling
         progress_file = output_dir / "progress.json"
-        if progress_file.exists():
-            resume_input = input(f"{Fore.YELLOW}Previous scan found. Resume? (y/n):{Style.RESET_ALL} ").strip().lower()
-            resume = resume_input == 'y'
+        if resume is None:
+            resume = False
+            if progress_file.exists() and interactive:
+                resume_input = input(f"{Fore.YELLOW}Previous scan found. Resume? (y/n):{Style.RESET_ALL} ").strip().lower()
+                resume = resume_input == 'y'
 
         # Load or create progress
         if resume:
@@ -1059,8 +1110,11 @@ For issues, questions, or contributions:
 
         return json.dumps(scrub(data))[:500]
 
-    async def analyze_with_gemini(self, finding: SecretFinding) -> Dict:
-        """Analyze finding with Google Gemini AI"""
+    def analyze_with_gemini(self, finding: SecretFinding) -> Dict:
+        """Analyze finding with Google Gemini AI (synchronous).
+
+        Kept synchronous so it can run inside the repo-scan worker threads.
+        """
         if not self.gemini_model:
             return {
                 "false_positive": False,
@@ -1179,6 +1233,31 @@ Respond in JSON format:
 
         return findings
 
+    def _build_gitleaks_cmd(self, clone_path: Path, output_file: Path) -> List[str]:
+        """Build a Gitleaks command compatible with the installed version.
+
+        Gitleaks 8.19.0 renamed `detect` to the `git` subcommand (with the
+        source as a positional). `detect`/`--source` are the legacy form. We
+        pick based on the detected version and cache the decision.
+        """
+        if not hasattr(self, '_gitleaks_use_git_subcmd'):
+            self._gitleaks_use_git_subcmd = False
+            _, version = self.check_gitleaks()
+            if version and version != "unknown":
+                m = re.search(r'(\d+)\.(\d+)', version)
+                if m and (int(m.group(1)), int(m.group(2))) >= (8, 19):
+                    self._gitleaks_use_git_subcmd = True
+
+        common = [
+            '--log-opts', '--all',          # scan entire git history
+            '--report-format', 'json',
+            '--report-path', str(output_file),
+            '-v',
+        ]
+        if self._gitleaks_use_git_subcmd:
+            return ['gitleaks', 'git', str(clone_path)] + common
+        return ['gitleaks', 'detect', '--source', str(clone_path)] + common
+
     def run_gitleaks_local(self, clone_path: Path, repo_url: str, output_file: Path) -> List[SecretFinding]:
         """Run Gitleaks scan on a local clone with full git history"""
         findings = []
@@ -1186,14 +1265,9 @@ Respond in JSON format:
         try:
             self.logger.info(f"Running Gitleaks on {clone_path}")
 
-            # Run gitleaks with full history scan
+            # Run gitleaks with full history scan (command form depends on version)
             result = subprocess.run(
-                ['gitleaks', 'detect',
-                 '--source', str(clone_path),
-                 '--log-opts', '--all',  # Scan entire git history
-                 '--report-format', 'json',
-                 '--report-path', str(output_file),
-                 '-v'],
+                self._build_gitleaks_cmd(clone_path, output_file),
                 capture_output=True,
                 text=True,
                 timeout=self.config.scan_timeout
@@ -1254,6 +1328,28 @@ Respond in JSON format:
 
         return findings
 
+    # Detector hints that indicate a high-impact credential class
+    _HIGH_SIGNAL = (
+        "aws", "gcp", "azure", "rsa", "ssh", "private", "stripe", "github",
+        "gitlab", "slack", "token", "secret", "password", "oauth", "jwt",
+        "database", "connectionstring", "twilio", "sendgrid", "npm", "pgp",
+    )
+
+    def derive_severity(self, finding: SecretFinding) -> str:
+        """Deterministic severity, independent of the optional AI step.
+
+        Ensures the report's severity dashboard is meaningful even when Gemini
+        is not configured. A verified (live) secret is always CRITICAL.
+        """
+        if finding.verified:
+            return "CRITICAL"
+        name = f"{finding.detector_type} {finding.detector_name}".lower()
+        if "private" in name and "key" in name:
+            return "HIGH"
+        if any(k in name for k in self._HIGH_SIGNAL):
+            return "HIGH"
+        return "MEDIUM"
+
     def deduplicate_findings(self, findings: List[SecretFinding]) -> List[SecretFinding]:
         """Deduplicate findings from multiple tools based on repo+file+secret_hash"""
         deduplicated = {}
@@ -1278,6 +1374,61 @@ Respond in JSON format:
                 deduplicated[key] = finding
 
         return list(deduplicated.values())
+
+    def _scan_single_repo(self, repo_url: str, clone_dir: Path, scan_tool: str,
+                          trufflehog_available: bool,
+                          gitleaks_available: bool) -> Optional[List[SecretFinding]]:
+        """Clone, scan, dedup, score, and optionally AI-triage one repository.
+
+        Fully synchronous and self-contained so it can run inside a worker
+        thread. Returns the list of findings (possibly empty), or None if the
+        clone failed.
+        """
+        if self.shutdown_event.is_set():
+            return []
+
+        success, clone_path = self.clone_repository(repo_url, clone_dir)
+        if not success:
+            return None
+
+        self._register_clone(clone_path)
+        repo_findings: List[SecretFinding] = []
+        try:
+            if scan_tool in ("trufflehog", "both") and trufflehog_available:
+                repo_findings.extend(self.run_trufflehog_local(clone_path, repo_url))
+
+            if scan_tool in ("gitleaks", "both") and gitleaks_available:
+                gl_output = clone_dir / f"{clone_path.name}_gitleaks.json"
+                repo_findings.extend(self.run_gitleaks_local(clone_path, repo_url, gl_output))
+                if gl_output.exists():
+                    gl_output.unlink()
+        finally:
+            self.cleanup_clone(clone_path)
+            self._unregister_clone(clone_path)
+
+        # Deduplicate when both tools ran (dedup key includes repo_url)
+        if scan_tool == "both" and repo_findings:
+            repo_findings = self.deduplicate_findings(repo_findings)
+
+        # Deterministic severity baseline, independent of the optional AI step
+        for finding in repo_findings:
+            finding.severity = self.derive_severity(finding)
+
+        # Optional AI triage refines severity and flags false positives
+        if self.gemini_model and repo_findings:
+            for finding in repo_findings:
+                if self.shutdown_event.is_set():
+                    break
+                analysis = self.analyze_with_gemini(finding)
+                finding.ai_analysis = analysis
+                finding.false_positive = analysis.get('false_positive', False)
+                finding.needs_review = analysis.get('needs_review', False)
+                ai_sev = str(analysis.get('severity', '')).upper()
+                if ai_sev in ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW'):
+                    finding.severity = ai_sev
+                time.sleep(0.5)  # Rate limit Gemini API
+
+        return repo_findings
 
     def display_tool_selection_menu(self) -> Optional[str]:
         """Display tool selection menu and return user choice"""
@@ -1314,175 +1465,15 @@ Respond in JSON format:
             print(f"{Fore.RED}Invalid choice!{Style.RESET_ALL}")
             return None
 
-    def run_trufflehog_scan(self, repo_file: str, output_dir: Path):
-        """Run TruffleHog scan on repositories"""
-        if not os.path.exists(repo_file):
-            print(f"{Fore.RED}Error: Repo file '{repo_file}' not found!{Style.RESET_ALL}")
-            return
+    async def repo_scan(self, repo_file: Optional[str] = None,
+                        scan_tool: Optional[str] = None,
+                        resume: Optional[bool] = None):
+        """Repository scan functionality with tool selection.
 
-        with open(repo_file, 'r') as f:
-            repos = [line.strip() for line in f if line.strip()]
-
-        if not repos:
-            print(f"{Fore.RED}No repositories found in file!{Style.RESET_ALL}")
-            return
-
-        # Verify TruffleHog version before starting
-        print(f"\n{Fore.CYAN}Verifying TruffleHog installation...{Style.RESET_ALL}")
-        trufflehog_version = self._detect_trufflehog_version()
-
-        if not trufflehog_version:
-            print(f"{Fore.RED}Unable to determine TruffleHog version!{Style.RESET_ALL}")
-            print(f"{Fore.YELLOW}Please ensure TruffleHog v3.x is installed{Style.RESET_ALL}\n")
-            return
-
-        if trufflehog_version.startswith('2'):
-            print(f"{Fore.RED}TruffleHog v{trufflehog_version} detected (v2.x - OLD Python version)!{Style.RESET_ALL}")
-            print(f"{Fore.YELLOW}G-Hunter requires TruffleHog v3.x (Go binary){Style.RESET_ALL}")
-            print(f"\n{Fore.CYAN}Please uninstall the old version and install v3.x:{Style.RESET_ALL}")
-            print(f"  1. Uninstall old version: {Fore.WHITE}pip uninstall trufflehog{Style.RESET_ALL}")
-            print(f"  2. Install v3.x:")
-            print(f"     - macOS: {Fore.WHITE}brew install trufflehog{Style.RESET_ALL}")
-            print(f"     - Linux: {Fore.WHITE}Download from https://github.com/trufflesecurity/trufflehog/releases{Style.RESET_ALL}")
-            print(f"     - Or use: {Fore.WHITE}curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin{Style.RESET_ALL}\n")
-            return
-
-        print(f"{Fore.GREEN}✓ TruffleHog v{trufflehog_version} detected (v3.x compatible){Style.RESET_ALL}\n")
-        print(f"{Fore.YELLOW}Starting TruffleHog scan of {len(repos)} repositories...{Style.RESET_ALL}\n")
-
-        results_file = output_dir / "scan_results.json"
-        findings: List[SecretFinding] = []
-
-        with tqdm(total=len(repos), desc="Scanning repos") as pbar:
-            for repo_url in repos:
-                if self.shutdown_event.is_set():
-                    break
-
-                try:
-                    repo_name = repo_url.split('/')[-1] if '/' in repo_url else repo_url
-                    pbar.set_description(f"Scanning {repo_name}")
-
-                    # Run TruffleHog v3.x with correct syntax
-                    # Command: trufflehog git <url> --only-verified --json
-                    result = subprocess.run(
-                        ['trufflehog', 'git', repo_url, '--only-verified', '--json', '--no-update'],
-                        capture_output=True,
-                        text=True,
-                        timeout=300
-                    )
-
-                    if result.stdout:
-                        for line in result.stdout.strip().splitlines():
-                            try:
-                                secret_data = json.loads(line)
-
-                                # Create finding object
-                                finding = SecretFinding(
-                                    detector_type=secret_data.get('DetectorType', 'Unknown'),
-                                    detector_name=secret_data.get('DetectorName', 'Unknown'),
-                                    verified=secret_data.get('Verified', False),
-                                    raw_result=line,
-                                    repo_url=repo_url,
-                                    file_path=secret_data.get('SourceMetadata', {}).get('Data', {}).get('Filesystem', {}).get('file', 'Unknown'),
-                                    commit=secret_data.get('SourceMetadata', {}).get('Data', {}).get('Git', {}).get('commit', 'Unknown'),
-                                    timestamp=datetime.now().isoformat()
-                                )
-
-                                findings.append(finding)
-                                self.progress.secrets_found += 1
-
-                                if finding.verified:
-                                    self.progress.verified_secrets += 1
-
-                            except json.JSONDecodeError:
-                                continue
-
-                    # Check for errors in stderr
-                    if result.stderr:
-                        stderr_lower = result.stderr.lower()
-
-                        # Check for v2.x syntax errors (unrecognized arguments)
-                        if "unrecognized arguments" in stderr_lower or "git_url" in result.stderr:
-                            self.logger.error(f"TruffleHog v2.x syntax error detected!")
-                            self.logger.error(f"You may have TruffleHog v2.x (Python) installed instead of v3.x (Go)")
-                            self.logger.error(f"Run 'pip uninstall trufflehog' and install v3.x")
-                            # Don't spam - just log once
-                            if not hasattr(self, '_syntax_error_logged'):
-                                self._syntax_error_logged = True
-                                print(f"\n{Fore.RED}⚠️  TruffleHog syntax error detected!{Style.RESET_ALL}")
-                                print(f"{Fore.YELLOW}You likely have TruffleHog v2.x (Python) instead of v3.x (Go){Style.RESET_ALL}")
-                                print(f"{Fore.CYAN}To fix:{Style.RESET_ALL}")
-                                print(f"  1. pip uninstall trufflehog")
-                                print(f"  2. Install v3.x from https://github.com/trufflesecurity/trufflehog/releases\n")
-
-                        # Log other errors (but filter out the updater error which is harmless)
-                        elif "error" in stderr_lower and "updater" not in stderr_lower:
-                            self.logger.error(f"TruffleHog error for {repo_url}: {result.stderr}")
-
-                except subprocess.TimeoutExpired:
-                    self.logger.warning(f"Timeout scanning {repo_url}")
-                    self.progress.errors += 1
-                except Exception as e:
-                    self.logger.error(f"Error scanning {repo_url}: {e}")
-                    self.progress.errors += 1
-
-                pbar.update(1)
-                pbar.set_postfix({'Secrets': self.progress.secrets_found})
-
-        # AI Analysis if Gemini available
-        if self.gemini_model and findings:
-            print(f"\n{Fore.YELLOW}Running AI analysis on {len(findings)} findings...{Style.RESET_ALL}\n")
-
-            with tqdm(total=len(findings), desc="AI Analysis") as pbar:
-                for finding in findings:
-                    if self.shutdown_event.is_set():
-                        break
-
-                    # Run async analysis in sync context
-                    analysis = asyncio.run(self.analyze_with_gemini(finding))
-                    finding.ai_analysis = analysis
-                    finding.false_positive = analysis.get('false_positive', False)
-                    finding.needs_review = analysis.get('needs_review', False)
-                    finding.severity = analysis.get('severity', 'UNKNOWN')
-
-                    if finding.false_positive:
-                        self.progress.false_positives += 1
-                    if finding.needs_review:
-                        self.progress.needs_manual_review += 1
-
-                    pbar.update(1)
-                    time.sleep(0.5)  # Rate limit Gemini API
-
-        # Save results
-        with open(results_file, 'w') as f:
-            for finding in findings:
-                f.write(json.dumps({
-                    'detector_type': finding.detector_type,
-                    'detector_name': finding.detector_name,
-                    'verified': finding.verified,
-                    'repo_url': finding.repo_url,
-                    'file_path': finding.file_path,
-                    'commit': finding.commit,
-                    'timestamp': finding.timestamp,
-                    'severity': finding.severity,
-                    'false_positive': finding.false_positive,
-                    'needs_review': finding.needs_review,
-                    'ai_analysis': finding.ai_analysis,
-                    'raw_result': finding.raw_result
-                }) + '\n')
-
-        print(f"\n{Fore.GREEN}╔══════════════════════════════════════════════════════════════╗")
-        print(f"║              TruffleHog Scan Completed!                     ║")
-        print(f"╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}")
-        print(f"Total secrets found: {self.progress.secrets_found}")
-        print(f"Verified secrets: {self.progress.verified_secrets}")
-        print(f"False positives (AI): {self.progress.false_positives}")
-        print(f"Needs manual review: {self.progress.needs_manual_review}")
-        print(f"Errors: {self.progress.errors}")
-        print(f"\nResults saved to: {results_file}\n")
-
-    async def repo_scan(self):
-        """Repository scan functionality with tool selection"""
+        With no arguments the tool/repos-file/resume choices are gathered
+        interactively; supplying them skips all prompts (non-interactive/CLI).
+        """
+        interactive = repo_file is None
         print(f"\n{Fore.CYAN}╔══════════════════════════════════════════════════════════════╗")
         print(f"║         Repo Scan - Deep Secret Scanning                    ║")
         print(f"╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}\n")
@@ -1505,9 +1496,11 @@ Respond in JSON format:
             print("  • Gitleaks: https://github.com/gitleaks/gitleaks/releases\n")
             return
 
-        # Display tool selection menu
-        scan_tool = self.display_tool_selection_menu()
-        if not scan_tool:
+        # Tool selection (menu when interactive, else use provided value)
+        if scan_tool is None:
+            scan_tool = self.display_tool_selection_menu()
+        if scan_tool not in ("trufflehog", "gitleaks", "both"):
+            print(f"{Fore.RED}Invalid scan tool: {scan_tool!r}{Style.RESET_ALL}")
             return
 
         # Validate tool availability based on selection
@@ -1526,7 +1519,8 @@ Respond in JSON format:
                 scan_tool = "trufflehog"
 
         # Get repo file path
-        repo_file = input(f"\n{Fore.GREEN}Enter path to repos file:{Style.RESET_ALL} ").strip()
+        if repo_file is None:
+            repo_file = input(f"\n{Fore.GREEN}Enter path to repos file:{Style.RESET_ALL} ").strip()
 
         if not os.path.exists(repo_file):
             print(f"{Fore.RED}Error: Repo file '{repo_file}' not found!{Style.RESET_ALL}")
@@ -1553,12 +1547,13 @@ Respond in JSON format:
 
         # Resume support: reuse prior progress + results when a checkpoint exists
         progress_file = output_dir / "progress.json"
-        resume = False
-        if progress_file.exists():
-            resume_input = input(
-                f"{Fore.YELLOW}Previous repo scan found. Resume? (y/n):{Style.RESET_ALL} "
-            ).strip().lower()
-            resume = resume_input == 'y'
+        if resume is None:
+            resume = False
+            if progress_file.exists() and interactive:
+                resume_input = input(
+                    f"{Fore.YELLOW}Previous repo scan found. Resume? (y/n):{Style.RESET_ALL} "
+                ).strip().lower()
+                resume = resume_input == 'y'
 
         if resume:
             self.progress = self.load_progress(output_dir)
@@ -1594,99 +1589,62 @@ Respond in JSON format:
                 'found_by': finding.found_by
             })
 
-        # Keep the results file open for the whole scan and flush per-repo so an
-        # interrupted run can be resumed without losing completed work.
+        # Concurrency: clone+scan each repo in a worker thread (off the event
+        # loop), bounded by max_repo_workers. All shared-state mutation (file
+        # writes, progress counters, checkpoint) is serialized via write_lock,
+        # and results are flushed + checkpointed per-repo so a run can resume.
+        sem = asyncio.Semaphore(self.config.max_repo_workers)
+        write_lock = asyncio.Lock()
+
         with open(results_file, results_mode) as results_out:
-            with tqdm(total=len(repos), initial=len(self.progress.scanned_repos),
-                      desc="Scanning repos") as pbar:
-                for repo_url in repos:
+            with tqdm(total=len(repos), desc="Scanning repos") as pbar:
+
+                async def process(repo_url: str):
                     if self.shutdown_event.is_set():
-                        print(f"\n{Fore.YELLOW}Scan interrupted. Progress saved - resume to continue.{Style.RESET_ALL}")
-                        break
+                        return
+                    async with sem:
+                        if self.shutdown_event.is_set():
+                            return
 
-                    # Skip if already scanned (resume)
-                    if repo_url in self.progress.scanned_repos:
-                        pbar.update(1)
-                        continue
+                        # Skip already-scanned repos (resume)
+                        if repo_url in self.progress.scanned_repos:
+                            async with write_lock:
+                                pbar.update(1)
+                            return
 
-                    repo_name = self.get_repo_name_from_url(repo_url)
-                    pbar.set_description(f"Cloning {repo_name}")
+                        repo_findings = await asyncio.to_thread(
+                            self._scan_single_repo, repo_url, clone_dir, scan_tool,
+                            trufflehog_available, gitleaks_available,
+                        )
 
-                    # Clone repository
-                    success, clone_path = self.clone_repository(repo_url, clone_dir)
+                        async with write_lock:
+                            if repo_findings is None:
+                                # Clone failed
+                                self.progress.clone_failures += 1
+                                self.progress.errors += 1
+                            else:
+                                for finding in repo_findings:
+                                    self.progress.secrets_found += 1
+                                    if finding.verified:
+                                        self.progress.verified_secrets += 1
+                                    if finding.false_positive:
+                                        self.progress.false_positives += 1
+                                    if finding.needs_review:
+                                        self.progress.needs_manual_review += 1
+                                    results_out.write(serialize(finding) + '\n')
+                                results_out.flush()
+                                self.progress.scanned_repos.add(repo_url)
+                            self.save_progress(output_dir)
+                            pbar.update(1)
+                            pbar.set_postfix({
+                                'Secrets': self.progress.secrets_found,
+                                'Errors': self.progress.errors,
+                            })
 
-                    if not success:
-                        self.progress.clone_failures += 1
-                        self.progress.errors += 1
-                        self.save_progress(output_dir)
-                        pbar.update(1)
-                        pbar.set_postfix({'Errors': self.progress.errors, 'Secrets': self.progress.secrets_found})
-                        continue
+                await asyncio.gather(*(process(r) for r in repos))
 
-                    # Track current clone for cleanup on interrupt
-                    self._current_clone_path = clone_path
-
-                    repo_findings = []
-
-                    try:
-                        # Run selected tool(s)
-                        if scan_tool in ["trufflehog", "both"] and trufflehog_available:
-                            pbar.set_description(f"TruffleHog: {repo_name}")
-                            tf_findings = self.run_trufflehog_local(clone_path, repo_url)
-                            repo_findings.extend(tf_findings)
-
-                        if scan_tool in ["gitleaks", "both"] and gitleaks_available:
-                            pbar.set_description(f"Gitleaks: {repo_name}")
-                            gl_output = clone_dir / f"{repo_name}_gitleaks.json"
-                            gl_findings = self.run_gitleaks_local(clone_path, repo_url, gl_output)
-                            repo_findings.extend(gl_findings)
-                            # Cleanup gitleaks output file
-                            if gl_output.exists():
-                                gl_output.unlink()
-                    finally:
-                        # Always cleanup clone
-                        pbar.set_description(f"Cleanup: {repo_name}")
-                        self.cleanup_clone(clone_path)
-                        self._current_clone_path = None
-
-                    # Deduplicate this repo's findings when both tools ran
-                    # (the dedup key includes repo_url, so per-repo == global)
-                    if scan_tool == "both" and repo_findings:
-                        repo_findings = self.deduplicate_findings(repo_findings)
-
-                    # AI analysis per-repo so resumed runs keep analyzed results
-                    if self.gemini_model and repo_findings:
-                        for finding in repo_findings:
-                            if self.shutdown_event.is_set():
-                                break
-                            analysis = await self.analyze_with_gemini(finding)
-                            finding.ai_analysis = analysis
-                            finding.false_positive = analysis.get('false_positive', False)
-                            finding.needs_review = analysis.get('needs_review', False)
-                            finding.severity = analysis.get('severity', 'UNKNOWN')
-                            if finding.false_positive:
-                                self.progress.false_positives += 1
-                            if finding.needs_review:
-                                self.progress.needs_manual_review += 1
-                            time.sleep(0.5)  # Rate limit Gemini API
-
-                    # Update counters and persist findings for this repo
-                    for finding in repo_findings:
-                        self.progress.secrets_found += 1
-                        if finding.verified:
-                            self.progress.verified_secrets += 1
-                        results_out.write(serialize(finding) + '\n')
-                    results_out.flush()
-
-                    # Mark repo as scanned and checkpoint
-                    self.progress.scanned_repos.add(repo_url)
-                    self.save_progress(output_dir)
-
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'Secrets': self.progress.secrets_found,
-                        'Errors': self.progress.errors
-                    })
+        if self.shutdown_event.is_set():
+            print(f"\n{Fore.YELLOW}Scan interrupted. Progress saved - resume to continue.{Style.RESET_ALL}")
 
         # Cleanup clones directory if empty
         try:
@@ -2407,21 +2365,58 @@ Respond in JSON format:
 
 # ==================== MAIN FUNCTION ====================
 
-def main():
-    """Main function"""
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser (interactive menu + non-interactive subcommands)."""
     parser = argparse.ArgumentParser(
+        prog="ghunter",
         description="G-Hunter - Professional GitHub Secrets & Sensitive Info Hunter",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  ghunter                              # interactive menu\n"
+            "  ghunter scan -k acme.com,acme-corp   # GitHub dork search\n"
+            "  ghunter repo -f outputs/acme.com/repos.txt -t both\n"
+            "  ghunter report -i outputs/acme.com/scan_results.json\n"
+        ),
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
-    parser.add_argument("--no-menu", action="store_true", help="Skip menu and exit (for testing)")
+    parser.add_argument("--no-menu", action="store_true", help="Initialize and exit (for testing)")
+
+    sub = parser.add_subparsers(dest="command")
+
+    scan_p = sub.add_parser("scan", help="GitHub dork search (non-interactive)")
+    scan_p.add_argument("-k", "--keywords", required=True, help="Comma-separated keywords")
+    scan_p.add_argument("-d", "--dorks", default="gitDorks.txt", help="Path to dorks file")
+    scan_p.add_argument("--resume", action="store_true", help="Resume a prior scan")
+
+    repo_p = sub.add_parser("repo", help="Deep secret scan of repositories (non-interactive)")
+    repo_p.add_argument("-f", "--repos-file", required=True, help="File of repo URLs (one per line)")
+    repo_p.add_argument("-t", "--tool", choices=["trufflehog", "gitleaks", "both"],
+                        default="both", help="Scanner to use")
+    repo_p.add_argument("--resume", action="store_true", help="Resume a prior scan")
+    repo_p.add_argument("--ai-send-raw", action="store_true",
+                        help="Send raw secret data to Gemini (off by default)")
+
+    report_p = sub.add_parser("report", help="Generate an HTML report from scan results")
+    report_p.add_argument("-i", "--input", required=True, help="Path to scan_results.json")
+
+    return parser
+
+
+def main():
+    """Main function"""
+    parser = build_parser()
     args = parser.parse_args()
 
-    # Load configuration from environment
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    # The report command works offline and needs no GitHub token.
+    needs_token = args.command in (None, "scan", "repo")
     github_token = os.getenv("GITHUB_TOKEN")
     gemini_api_key = os.getenv("GEMINI_API_KEY")
 
-    if not github_token:
+    if needs_token and not github_token:
         print(f"{Fore.RED}ERROR: GITHUB_TOKEN environment variable not set!{Style.RESET_ALL}")
         print(f"\n{Fore.YELLOW}Please set your GitHub Personal Access Token:{Style.RESET_ALL}")
         print("  export GITHUB_TOKEN='ghp_your_token_here'")
@@ -2429,16 +2424,12 @@ def main():
         print(f"\n{Fore.CYAN}Get your token at: https://github.com/settings/tokens{Style.RESET_ALL}\n")
         sys.exit(1)
 
-    # Create config
     config = Config(
-        github_token=github_token,
-        gemini_api_key=gemini_api_key
+        github_token=github_token or "",
+        gemini_api_key=gemini_api_key,
+        ai_send_raw=getattr(args, "ai_send_raw", False),
     )
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    # Create and run G-Hunter
     hunter = GHunter(config)
 
     if args.no_menu:
@@ -2446,7 +2437,17 @@ def main():
         sys.exit(0)
 
     try:
-        asyncio.run(hunter.run())
+        if args.command == "scan":
+            keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
+            asyncio.run(hunter.git_scan(keywords=keywords, dorks_file=args.dorks,
+                                        resume=args.resume))
+        elif args.command == "repo":
+            asyncio.run(hunter.repo_scan(repo_file=args.repos_file, scan_tool=args.tool,
+                                         resume=args.resume))
+        elif args.command == "report":
+            hunter.generate_html_report(args.input)
+        else:
+            asyncio.run(hunter.run())
     except KeyboardInterrupt:
         print(f"\n{Fore.YELLOW}Scan interrupted by user{Style.RESET_ALL}")
     except Exception as e:

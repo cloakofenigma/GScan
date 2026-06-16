@@ -81,6 +81,30 @@ Menu options:
 4. **Help** - Detailed usage instructions
 5. **Exit**
 
+### Non-Interactive CLI (automation / CI)
+
+All three actions can run without the menu, so G-Hunter can be scripted or run
+in CI:
+
+```bash
+# 1. GitHub dork search
+python ghunter_pro.py scan -k acme.com,acme-corp [-d gitDorks.txt] [--resume]
+
+# 2. Deep secret scan of discovered repos
+python ghunter_pro.py repo -f outputs/acme.com/repos.txt -t both [--resume]
+#    -t {trufflehog|gitleaks|both}   --ai-send-raw  (opt in to send raw data to Gemini)
+
+# 3. Generate the HTML report (works offline, no token required)
+python ghunter_pro.py report -i outputs/acme.com/scan_results.json
+```
+
+If installed as a package (`pip install -e .`), the `ghunter` console command is
+equivalent to `python ghunter_pro.py`.
+
+> **Privacy note:** AI triage redacts the raw secret value before sending a
+> finding to Gemini. Pass `--ai-send-raw` only if you explicitly accept sending
+> raw secret data off-host.
+
 ### Option 1: Git Scan
 
 Searches GitHub using keywords and git dorks:
