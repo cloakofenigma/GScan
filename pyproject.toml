@@ -29,6 +29,7 @@ dev = ["pytest>=7.4", "pytest-asyncio>=0.23"]
 ghunter = "ghunter_pro:main"
 
 [tool.setuptools]
+packages = ["ghunter"]
 py-modules = ["ghunter_pro"]
 
 [tool.pytest.ini_options]

@@ -5,17 +5,17 @@ report rendering) and the concurrent repo-scan orchestration with the scanner
 mocked, so they run without git, network, or external scanners installed.
 """
 import asyncio
-import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
-# Load the single-module app directly from the repo root.
+# Make the repo root importable, then load via the compatibility shim, which
+# re-exports the public names from the `ghunter` package.
 _ROOT = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location("ghunter_pro", _ROOT / "ghunter_pro.py")
-gh = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(gh)
+sys.path.insert(0, str(_ROOT))
+import ghunter_pro as gh  # noqa: E402
 
 
 def make_finding(**kw):
