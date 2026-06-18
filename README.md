@@ -2,16 +2,18 @@
 
 **Professional GitHub Secrets & Sensitive Information Hunter**
 
-G-Hunter is an enterprise-grade security tool for discovering exposed secrets, API keys, credentials, and sensitive information on GitHub repositories using advanced dorking techniques, TruffleHog scanning, and AI-powered analysis.
+G-Hunter is an enterprise-grade security tool for discovering exposed secrets, API keys, credentials, and sensitive information on GitHub repositories using advanced dorking techniques, TruffleHog/Gitleaks scanning, and AI-powered analysis.
 
 ## ⚡ Features
 
-- **🎯 GitHub Dorking** - Advanced search using 500+ git dorks
-- **🔐 TruffleHog Integration** - Deep scanning with verified secret detection
-- **🤖 AI Analysis** - Google Gemini 2.0 for false positive reduction
-- **📊 HTML Reports** - Modern, interactive dashboards with filtering
+- **🎯 GitHub Dorking** - Advanced search using 500+ git dorks, with full result pagination
+- **🔐 TruffleHog & Gitleaks** - Clone-first local scanning; TruffleHog verifies live secrets, Gitleaks adds pattern coverage, with automatic dedup when running both
+- **🤖 AI Analysis** - Google Gemini for false-positive reduction; secret values are redacted before being sent off-host by default
+- **📊 HTML Reports** - Modern, interactive dashboards with filtering (Jinja2 + autoescape)
 - **💾 Resume Capability** - Never lose progress on interrupted scans
-- **⚡ Async Scanning** - 10x faster with concurrent requests
+- **⚡ Concurrent Scanning** - Async GitHub search and bounded-concurrency repo scanning
+- **🧮 Deterministic Severity** - Reproducible severity classification independent of AI
+- **🤖 Non-Interactive CLI** - Scriptable `scan` / `repo` / `report` subcommands for CI
 - **📁 Organized Output** - Clean directory structure per keyword
 - **🎨 Beautiful UI** - Colored terminal output with progress bars
 
@@ -19,15 +21,15 @@ G-Hunter is an enterprise-grade security tool for discovering exposed secrets, A
 
 ### Prerequisites
 
-1. **Python 3.8+**
-2. **GitHub Personal Access Token** (PAT)
+1. **Python 3.9+**
+2. **Git** (required for clone-based repo scanning)
+3. **GitHub Personal Access Token** (PAT)
    - Create at: https://github.com/settings/tokens
    - Required scope: `public_repo`
-3. **TruffleHog** (for deep scanning)
-   - macOS: `brew install trufflehog`
-   - pip: `pip install trufflehog`
-   - Binary: https://github.com/trufflesecurity/trufflehog/releases
-4. **Google Gemini API Key** (optional, for AI analysis)
+4. **TruffleHog and/or Gitleaks** (for deep scanning — at least one)
+   - TruffleHog: `brew install trufflehog` / `pip install trufflehog` / [releases](https://github.com/trufflesecurity/trufflehog/releases)
+   - Gitleaks: `brew install gitleaks` / [releases](https://github.com/gitleaks/gitleaks/releases)
+5. **Google Gemini API Key** (optional, for AI analysis)
    - Get at: https://makersuite.google.com/app/apikey
 
 ### Installation
@@ -358,9 +360,9 @@ Developed by cybersecurity professionals for the security community.
 
 **Technologies:**
 - GitHub Code Search API
-- TruffleHog (Truffle Security)
-- Google Gemini 2.0 (Google AI)
-- Python asyncio ecosystem
+- TruffleHog (Truffle Security) & Gitleaks
+- Google Gemini (Google AI)
+- Python asyncio ecosystem + Jinja2
 
 ## 📄 License
 
@@ -370,4 +372,4 @@ See LICENSE file for details.
 
 **Made with ❤️ for the security community**
 
-*G-Hunter v3.0 Professional Edition*
+*G-Hunter v3.1.0 Professional Edition*

@@ -2,6 +2,8 @@
 from typing import Optional
 from colorama import Fore, Back, Style
 
+from .version import __version__
+
 def display_banner():
     """Display G-Hunter ASCII art banner"""
     banner = f"""
@@ -15,7 +17,7 @@ def display_banner():
 ║   ╚═════╝       ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝   ║
 ║                                                                          ║
 ║          {Fore.YELLOW}Professional GitHub Secrets & Sensitive Info Hunter{Fore.CYAN}           ║
-║                    {Fore.GREEN}v3.0 Enterprise Edition{Fore.CYAN}                              ║
+║                    {Fore.GREEN}v{__version__} Enterprise Edition{Fore.CYAN}                            ║
 ║                                                                          ║
 ║  {Fore.WHITE}Hunt for exposed secrets and sensitive information on GitHub{Fore.CYAN}        ║
 ║  {Fore.RED}⚠️  Use responsibly and only with proper authorization  ⚠️{Fore.CYAN}          ║

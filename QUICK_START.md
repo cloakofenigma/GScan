@@ -1,4 +1,4 @@
-# G-Hunter v3.0 - Quick Start Guide
+# G-Hunter v3.1.0 - Quick Start Guide
 
 ## 🚨 CRITICAL FIRST STEP - Security
 
@@ -306,5 +306,5 @@ Common words:     test, demo, example
 
 ---
 
-*G-Hunter v3.0 Professional Edition*
+*G-Hunter v3.1.0 Professional Edition*
 *Security made simple*

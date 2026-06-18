@@ -6,6 +6,7 @@ aiohttp>=3.9.0,<4
 python-dotenv>=1.0.0,<2
 tqdm>=4.66.0,<5
 colorama>=0.4.6,<1
+jinja2>=3.1.0,<4
 
 # AI Analysis (optional but recommended). Also available via: pip install -e ".[ai]"
 # The tool degrades gracefully and skips AI triage if this is not installed.
