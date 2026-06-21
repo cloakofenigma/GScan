@@ -18,6 +18,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  ghunter                              # interactive menu\n"
             "  ghunter scan -k acme.com,acme-corp   # GitHub dork search\n"
+            "  ghunter scan -k acme --commits       # also search commit history\n"
+            "  ghunter enum -o acme-corp            # all of an org/user's repos + gists\n"
             "  ghunter repo -f outputs/acme.com/repos.txt -t both\n"
             "  ghunter report -i outputs/acme.com/scan_results.json\n"
         ),
@@ -31,6 +33,12 @@ def build_parser() -> argparse.ArgumentParser:
     scan_p.add_argument("-k", "--keywords", required=True, help="Comma-separated keywords")
     scan_p.add_argument("-d", "--dorks", default="gitDorks.txt", help="Path to dorks file")
     scan_p.add_argument("--resume", action="store_true", help="Resume a prior scan")
+    scan_p.add_argument("--commits", action="store_true",
+                        help="Also search commit history (code search misses these)")
+
+    enum_p = sub.add_parser("enum", help="Enumerate all repos/gists for an org or user")
+    enum_p.add_argument("-o", "--owner", required=True, help="GitHub org or username")
+    enum_p.add_argument("--no-gists", action="store_true", help="Skip public gists")
 
     repo_p = sub.add_parser("repo", help="Deep secret scan of repositories (non-interactive)")
     repo_p.add_argument("-f", "--repos-file", required=True, help="File of repo URLs (one per line)")
@@ -56,7 +64,7 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     # The report command works offline and needs no GitHub token.
-    needs_token = args.command in (None, "scan", "repo")
+    needs_token = args.command in (None, "scan", "enum", "repo")
     github_token = os.getenv("GITHUB_TOKEN")
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     gemini_model = os.getenv("GEMINI_MODEL")  # optional override of the default
@@ -86,7 +94,9 @@ def main():
         if args.command == "scan":
             keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
             asyncio.run(hunter.git_scan(keywords=keywords, dorks_file=args.dorks,
-                                        resume=args.resume))
+                                        resume=args.resume, include_commits=args.commits))
+        elif args.command == "enum":
+            asyncio.run(hunter.enum_scan(owner=args.owner, include_gists=not args.no_gists))
         elif args.command == "repo":
             asyncio.run(hunter.repo_scan(repo_file=args.repos_file, scan_tool=args.tool,
                                          resume=args.resume))

@@ -50,6 +50,125 @@ class SearchMixin:
                 pass
         return 60
 
+    async def _get_page(self, url: str, params: dict) -> Tuple[Optional[list], Optional[int]]:
+        """Fetch one page from a GitHub REST/search endpoint with retry + backoff.
+
+        Returns (items, status). `items` is None only on a hard failure (so the
+        caller stops paging). Search endpoints wrap results in {"items": [...]};
+        list endpoints return a bare array — both are normalized to a list.
+        """
+        for attempt in range(self.config.retry_attempts):
+            try:
+                async with self.session.get(url, params=params) as response:
+                    status = response.status
+                    if status == 200:
+                        data = await response.json()
+                        if isinstance(data, dict):
+                            items = data.get("items", [])
+                        else:
+                            items = data
+                        return (items if isinstance(items, list) else []), 200
+                    if status in (403, 429):
+                        wait = self._rate_limit_wait(response)
+                        self.logger.warning(f"Rate limit on {url}, waiting {wait}s...")
+                        await asyncio.sleep(wait)
+                        continue
+                    if status in (404, 422):
+                        return [], status
+                    self.logger.error(f"HTTP {status} for {url}")
+                    return None, status
+            except Exception as e:
+                self.logger.error(f"Attempt {attempt + 1} failed for {url}: {e}")
+                if attempt < self.config.retry_attempts - 1:
+                    await asyncio.sleep(2 ** attempt)
+        return None, None
+
+    async def _paginate(self, url: str, params: dict) -> Tuple[list, Optional[int]]:
+        """Collect items across pages from a GitHub endpoint (up to max_pages).
+
+        Returns (items, first_page_status). The status lets callers distinguish
+        e.g. a 404 owner from an empty-but-valid result set.
+        """
+        per_page = 100
+        results: list = []
+        first_status = None
+
+        for page in range(1, self.config.max_pages + 1):
+            if self.shutdown_event.is_set():
+                break
+            items, status = await self._get_page(
+                url, {**params, "per_page": per_page, "page": page}
+            )
+            if page == 1:
+                first_status = status
+            if items is None:
+                break
+            results.extend(items)
+            if len(items) < per_page:
+                break
+            await asyncio.sleep(60 / self.config.rate_limit)
+
+        return results, first_status
+
+    @staticmethod
+    def _as_git_url(url: Optional[str]) -> Optional[str]:
+        """Normalize a repo/gist URL to a clone-ready .git URL."""
+        if not url:
+            return None
+        return url if url.endswith(".git") else url + ".git"
+
+    async def enumerate_owner_repos(self, owner: str) -> Set[str]:
+        """List every repository for an org or user (bypasses the 1000 cap).
+
+        Tries the org endpoint first, then the user endpoint, so the caller need
+        not know which kind of owner it is.
+        """
+        repos: Set[str] = set()
+        for kind, type_param in (("orgs", "all"), ("users", "owner")):
+            items, status = await self._paginate(
+                f"https://api.github.com/{kind}/{owner}/repos", {"type": type_param}
+            )
+            if status == 404:
+                continue  # not this kind of owner; try the next
+            for item in items:
+                git_url = self._as_git_url(item.get("clone_url") or item.get("html_url"))
+                if git_url:
+                    repos.add(git_url)
+            break  # first non-404 owner kind wins
+        return repos
+
+    async def enumerate_user_gists(self, user: str) -> Set[str]:
+        """List a user's public gists as clone-ready git URLs."""
+        gists: Set[str] = set()
+        items, _ = await self._paginate(
+            f"https://api.github.com/users/{user}/gists", {}
+        )
+        for item in items:
+            git_url = self._as_git_url(item.get("git_pull_url"))
+            if git_url:
+                gists.add(git_url)
+        return gists
+
+    async def search_commits(self, keyword: str, dork: str = "") -> Tuple[Set[str], Set[str]]:
+        """Search commit messages/content (a source code search misses).
+
+        Returns (repo_git_urls, commit_urls).
+        """
+        repos, urls = set(), set()
+        query = f"{keyword} {dork}".strip()
+        items, _ = await self._paginate(
+            "https://api.github.com/search/commits", {"q": query}
+        )
+        for item in items:
+            repo_html = (item.get("repository") or {}).get("html_url")
+            git_url = self._as_git_url(repo_html)
+            if git_url:
+                repos.add(git_url)
+            commit_url = item.get("html_url")
+            if commit_url:
+                urls.add(commit_url)
+        return repos, urls
+
     # Non-overlapping file-size buckets (bytes) used to partition a query that
     # saturates the 1000-result cap. Together they cover all file sizes, so the
     # union is complete; sets dedup any overlap with the base query.
@@ -198,11 +317,13 @@ class SearchMixin:
 
     async def git_scan(self, keywords: Optional[List[str]] = None,
                         dorks_file: Optional[str] = None,
-                        resume: Optional[bool] = None):
+                        resume: Optional[bool] = None,
+                        include_commits: bool = False):
         """Main Git scan functionality.
 
         When called with no arguments the parameters are gathered interactively;
         when arguments are supplied (non-interactive/CLI mode) prompts are skipped.
+        With include_commits=True, each query also searches commit history.
         """
         interactive = keywords is None
         print(f"\n{Fore.CYAN}╔══════════════════════════════════════════════════════════════╗")
@@ -292,6 +413,12 @@ class SearchMixin:
 
                             repos, urls = await self.search_github(keyword, dork)
 
+                            # Optionally augment with commit-search results
+                            if include_commits:
+                                c_repos, c_urls = await self.search_commits(keyword, dork)
+                                repos |= c_repos
+                                urls |= c_urls
+
                             # Write new results
                             for repo in repos:
                                 if repo not in self.progress.completed_repos:
@@ -343,4 +470,54 @@ class SearchMixin:
         print(f"\nResults saved to: {output_dir}/")
         print(f"  • {repos_file_path}")
         print(f"  • {urls_file_path}\n")
+
+    async def enum_scan(self, owner: Optional[str] = None,
+                        include_gists: bool = True):
+        """Enumerate every repo (and optionally gist) for an org/user.
+
+        This bypasses the code-search 1000-result cap entirely by listing repos
+        directly. Output is a repos.txt that feeds straight into `repo` scan.
+        """
+        print(f"\n{Fore.CYAN}╔══════════════════════════════════════════════════════════════╗")
+        print(f"║          Enumerate - Org/User Repositories & Gists          ║")
+        print(f"╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}\n")
+
+        if owner is None:
+            owner = input(f"{Fore.GREEN}Enter GitHub org or username:{Style.RESET_ALL} ").strip()
+        if not owner:
+            print(f"{Fore.RED}Error: No owner provided!{Style.RESET_ALL}")
+            return
+
+        safe_owner = owner.replace("/", "_").replace("\\", "_")
+        output_dir = self.config.output_base_dir / safe_owner
+        output_dir.mkdir(parents=True, exist_ok=True)
+        repos_file_path = output_dir / "repos.txt"
+
+        print(f"{Fore.YELLOW}Enumerating '{owner}'...{Style.RESET_ALL}")
+        await self.create_session()
+        try:
+            repos = await self.enumerate_owner_repos(owner)
+            gists = await self.enumerate_user_gists(owner) if include_gists else set()
+        finally:
+            await self.close_session()
+
+        all_repos = repos | gists
+        if not all_repos:
+            print(f"{Fore.RED}No repositories or gists found for '{owner}'.{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}(Check the name, or the account may have no public repos.){Style.RESET_ALL}\n")
+            return
+
+        with open(repos_file_path, "w") as f:
+            for repo in sorted(all_repos):
+                f.write(f"{repo}\n")
+
+        print(f"\n{Fore.GREEN}╔══════════════════════════════════════════════════════════════╗")
+        print(f"║                  Enumeration Completed!                     ║")
+        print(f"╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}")
+        print(f"Repositories: {len(repos)}")
+        if include_gists:
+            print(f"Gists: {len(gists)}")
+        print(f"Total (deduplicated): {len(all_repos)}")
+        print(f"\nSaved to: {repos_file_path}")
+        print(f"\n{Fore.CYAN}Next:{Style.RESET_ALL} python ghunter_pro.py repo -f {repos_file_path} -t both\n")
 

@@ -7,6 +7,8 @@ G-Hunter is an enterprise-grade security tool for discovering exposed secrets, A
 ## ⚡ Features
 
 - **🎯 GitHub Dorking** - Advanced search using 500+ git dorks, with full pagination and automatic `size:` query-splitting to recover results beyond GitHub's 1000-per-query cap
+- **🏢 Org/User Enumeration** - List every repo + public gist for an owner via the REST API, bypassing the code-search cap entirely
+- **📜 Commit Search** - Optionally search commit history (`--commits`), catching secrets that file/code search misses
 - **🔐 TruffleHog & Gitleaks** - Clone-first local scanning; TruffleHog verifies live secrets, Gitleaks adds pattern coverage, with automatic dedup when running both
 - **🤖 AI Analysis** - Google Gemini (default `gemini-2.5-flash`) for false-positive reduction; secret values are redacted before being sent off-host by default
 - **📊 HTML Reports** - Modern, interactive dashboards with filtering (Jinja2 + autoescape)
@@ -94,6 +96,11 @@ in CI:
 ```bash
 # 1. GitHub dork search
 python ghunter_pro.py scan -k acme.com,acme-corp [-d gitDorks.txt] [--resume]
+#    --commits   also search commit history (code search misses these)
+
+# 1b. Enumerate ALL repos + public gists for an org/user (bypasses the
+#     1000-result code-search cap entirely) -> writes outputs/<owner>/repos.txt
+python ghunter_pro.py enum -o acme-corp [--no-gists]
 
 # 2. Deep secret scan of discovered repos
 python ghunter_pro.py repo -f outputs/acme.com/repos.txt -t both [--resume]

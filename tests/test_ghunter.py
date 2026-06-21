@@ -390,12 +390,14 @@ class _FakeResp:
 class _FakeSession:
     def __init__(self, responder):
         self.responder = responder
-        self.queries = []
+        self.queries = []   # params dicts
+        self.calls = []     # (url, params) tuples
         self.closed = False
 
     def get(self, url, params=None):
         self.queries.append(params)
-        return _FakeResp(*self.responder(params))
+        self.calls.append((url, params))
+        return _FakeResp(*self.responder(url, params))
 
     async def close(self):
         self.closed = True
@@ -422,7 +424,7 @@ def test_size_qualifier_ranges():
 def test_search_splits_when_capped():
     h = _wire_search()
 
-    def responder(params):
+    def responder(url, params):
         q, page = params["q"], params["page"]
         if "size:" not in q:
             # 10 full pages -> saturates the 1000-result cap
@@ -443,7 +445,7 @@ def test_search_splits_when_capped():
 def test_search_no_split_when_under_cap():
     h = _wire_search()
 
-    def responder(params):
+    def responder(url, params):
         # Single short page -> genuine last page, never capped
         return 200, {"items": [_item("a"), _item("b")]}
 
@@ -458,7 +460,7 @@ def test_search_respects_split_disabled():
     h = gh.GHunter(gh.Config(github_token="x", rate_limit=100000, split_on_cap=False))
     h.semaphore = asyncio.Semaphore(1)
 
-    def responder(params):
+    def responder(url, params):
         return 200, {"items": [_item(f"r-{params['page']}-{i}") for i in range(100)]}
 
     h.session = _FakeSession(responder)
@@ -466,11 +468,101 @@ def test_search_respects_split_disabled():
     assert all("size:" not in p["q"] for p in h.session.queries)
 
 
+# --------------------------------------------- org/user/gist/commit enum -----
+def _repo_obj(name):
+    return {"clone_url": f"https://github.com/o/{name}.git",
+            "html_url": f"https://github.com/o/{name}"}
+
+
+def test_enumerate_owner_repos_org():
+    h = _wire_search()
+
+    def responder(url, params):
+        if "/orgs/acme/repos" in url:
+            return 200, [_repo_obj("a"), _repo_obj("b")]
+        return 404, []   # user endpoint shouldn't be needed
+
+    h.session = _FakeSession(responder)
+    repos = asyncio.run(h.enumerate_owner_repos("acme"))
+    assert repos == {"https://github.com/o/a.git", "https://github.com/o/b.git"}
+    assert all("/users/" not in u for u, _ in h.session.calls)  # org matched first
+
+
+def test_enumerate_owner_repos_user_fallback():
+    h = _wire_search()
+
+    def responder(url, params):
+        if "/orgs/" in url:
+            return 404, []        # not an org
+        return 200, [_repo_obj("u1")]
+
+    h.session = _FakeSession(responder)
+    repos = asyncio.run(h.enumerate_owner_repos("alice"))
+    assert repos == {"https://github.com/o/u1.git"}
+    assert any("/users/alice/repos" in u for u, _ in h.session.calls)
+
+
+def test_enumerate_user_gists():
+    h = _wire_search()
+
+    def responder(url, params):
+        return 200, [{"git_pull_url": "https://gist.github.com/abc123.git"},
+                     {"git_pull_url": "https://gist.github.com/def456"}]
+
+    h.session = _FakeSession(responder)
+    gists = asyncio.run(h.enumerate_user_gists("alice"))
+    assert gists == {"https://gist.github.com/abc123.git", "https://gist.github.com/def456.git"}
+
+
+def test_search_commits():
+    h = _wire_search()
+
+    def responder(url, params):
+        return 200, {"items": [
+            {"repository": {"html_url": "https://github.com/o/r1"},
+             "html_url": "https://github.com/o/r1/commit/deadbeef"},
+        ]}
+
+    h.session = _FakeSession(responder)
+    repos, urls = asyncio.run(h.search_commits("acme", "password"))
+    assert repos == {"https://github.com/o/r1.git"}
+    assert urls == {"https://github.com/o/r1/commit/deadbeef"}
+    assert "/search/commits" in h.session.calls[0][0]
+
+
+def test_enum_scan_writes_repos_file(tmp_path):
+    h = gh.GHunter(gh.Config(github_token="x", rate_limit=100000,
+                             output_base_dir=tmp_path))
+
+    def responder(url, params):
+        if "/orgs/acme/repos" in url:
+            return 200, [_repo_obj("a")]
+        if "/gists" in url:
+            return 200, [{"git_pull_url": "https://gist.github.com/g1.git"}]
+        return 404, []
+
+    # enum_scan opens its own session via create_session; patch it to our fake
+    async def fake_create():
+        h.session = _FakeSession(responder)
+        h.semaphore = asyncio.Semaphore(1)
+
+    h.create_session = fake_create
+    asyncio.run(h.enum_scan(owner="acme", include_gists=True))
+
+    lines = (tmp_path / "acme" / "repos.txt").read_text().splitlines()
+    assert "https://github.com/o/a.git" in lines
+    assert "https://gist.github.com/g1.git" in lines
+
+
 # ----------------------------------------------------------- CLI parser ------
 def test_cli_parser_subcommands():
     p = gh.build_parser()
     a = p.parse_args(["scan", "-k", "acme.com,acme"])
-    assert a.command == "scan" and a.keywords == "acme.com,acme"
+    assert a.command == "scan" and a.keywords == "acme.com,acme" and a.commits is False
+    a = p.parse_args(["scan", "-k", "acme", "--commits"])
+    assert a.commits is True
+    a = p.parse_args(["enum", "-o", "acme"])
+    assert a.command == "enum" and a.owner == "acme" and a.no_gists is False
     a = p.parse_args(["repo", "-f", "repos.txt", "-t", "both"])
     assert a.command == "repo" and a.tool == "both"
     a = p.parse_args(["report", "-i", "out.json"])
