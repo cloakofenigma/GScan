@@ -372,6 +372,100 @@ def test_ghunter_uses_configured_gemini_model(monkeypatch):
     assert created["name"] == "gemini-2.5-flash"
 
 
+# ------------------------------------------------ query splitting on cap -----
+class _FakeResp:
+    def __init__(self, status, payload):
+        self.status, self._payload, self.headers = status, payload, {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    def __init__(self, responder):
+        self.responder = responder
+        self.queries = []
+        self.closed = False
+
+    def get(self, url, params=None):
+        self.queries.append(params)
+        return _FakeResp(*self.responder(params))
+
+    async def close(self):
+        self.closed = True
+
+
+def _item(name):
+    base = f"https://github.com/o/{name}"
+    return {"repository": {"html_url": base}, "html_url": base + "/blob/main/f.py"}
+
+
+def _wire_search(workers=1, rate=100000):
+    h = gh.GHunter(gh.Config(github_token="x", rate_limit=rate, max_repo_workers=workers))
+    h.semaphore = asyncio.Semaphore(1)
+    return h
+
+
+def test_size_qualifier_ranges():
+    h = _wire_search()
+    assert h._size_q(None, 999) == "size:<1000"
+    assert h._size_q(1000, 4999) == "size:1000..4999"
+    assert h._size_q(100000, None) == "size:>=100000"
+
+
+def test_search_splits_when_capped():
+    h = _wire_search()
+
+    def responder(params):
+        q, page = params["q"], params["page"]
+        if "size:" not in q:
+            # 10 full pages -> saturates the 1000-result cap
+            return 200, {"items": [_item(f"base-{page}-{i}") for i in range(100)]}
+        # size-bucketed sub-query: one short page, unique repo per bucket
+        tag = q.split("size:")[1].split()[0]
+        return 200, {"items": [_item(f"bucket-{tag}")]}
+
+    h.session = _FakeSession(responder)
+    repos, urls = asyncio.run(h.search_github("acme", "password"))
+
+    issued = [p["q"] for p in h.session.queries]
+    assert any("size:" in q for q in issued)            # splitting kicked in
+    assert any("base-" in r for r in repos)             # base results kept
+    assert sum("bucket-" in r for r in repos) == len(gh.GHunter._SIZE_BUCKETS)
+
+
+def test_search_no_split_when_under_cap():
+    h = _wire_search()
+
+    def responder(params):
+        # Single short page -> genuine last page, never capped
+        return 200, {"items": [_item("a"), _item("b")]}
+
+    h.session = _FakeSession(responder)
+    repos, urls = asyncio.run(h.search_github("acme", "password"))
+
+    assert all("size:" not in p["q"] for p in h.session.queries)
+    assert len(repos) == 2
+
+
+def test_search_respects_split_disabled():
+    h = gh.GHunter(gh.Config(github_token="x", rate_limit=100000, split_on_cap=False))
+    h.semaphore = asyncio.Semaphore(1)
+
+    def responder(params):
+        return 200, {"items": [_item(f"r-{params['page']}-{i}") for i in range(100)]}
+
+    h.session = _FakeSession(responder)
+    asyncio.run(h.search_github("acme", "password"))
+    assert all("size:" not in p["q"] for p in h.session.queries)
+
+
 # ----------------------------------------------------------- CLI parser ------
 def test_cli_parser_subcommands():
     p = gh.build_parser()

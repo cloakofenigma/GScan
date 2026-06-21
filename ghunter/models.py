@@ -16,6 +16,11 @@ class Config:
     max_concurrent: int = 5
     max_repo_workers: int = 3  # concurrent clone+scan workers in repo scan
     max_pages: int = 10  # GitHub code search caps results at 1000 (10 pages x 100)
+    # When a query saturates the 1000-result cap, re-run it partitioned by file
+    # size so each sub-query gets its own 1000 ceiling (recover otherwise
+    # unreachable results). max_split_depth bounds recursive subdivision cost.
+    split_on_cap: bool = True
+    max_split_depth: int = 1
     timeout: int = 30
     retry_attempts: int = 3
     # Privacy: when False, secret values are stripped before sending findings to

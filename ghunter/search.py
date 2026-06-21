@@ -50,79 +50,147 @@ class SearchMixin:
                 pass
         return 60
 
-    async def search_github(self, keyword: str, dork: str) -> Tuple[Set[str], Set[str]]:
-        """Search GitHub with retry logic and pagination.
+    # Non-overlapping file-size buckets (bytes) used to partition a query that
+    # saturates the 1000-result cap. Together they cover all file sizes, so the
+    # union is complete; sets dedup any overlap with the base query.
+    _SIZE_BUCKETS = [(None, 999), (1000, 4999), (5000, 19999), (20000, 99999), (100000, None)]
 
-        The code-search API returns at most 100 results per page and 1000
-        results total (10 pages). We page through results until a short page is
-        returned, the per-query cap is reached, or an error stops us.
+    @staticmethod
+    def _size_q(low, high) -> str:
+        """Build a GitHub `size:` qualifier for a (low, high) byte range."""
+        if low is None:
+            return f"size:<{high + 1}"
+        if high is None:
+            return f"size:>={low}"
+        return f"size:{low}..{high}"
+
+    async def _search_pages(self, query: str) -> Tuple[Set[str], Set[str], bool]:
+        """Page through one query. Returns (repos, urls, capped).
+
+        `capped` is True when the query exhausted the allowed page range with a
+        full final page — i.e. it likely hit the API's 1000-result ceiling and
+        more results exist than we can reach without partitioning.
+        """
+        repos, urls = set(), set()
+        per_page = 100
+        capped = False
+
+        for page in range(1, self.config.max_pages + 1):
+            if self.shutdown_event.is_set():
+                break
+
+            page_items = None  # None = page could not be fetched
+
+            for attempt in range(self.config.retry_attempts):
+                try:
+                    params = {"q": query, "per_page": per_page, "page": page}
+
+                    async with self.session.get(self.config.base_url, params=params) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            page_items = data.get("items", [])
+                            break
+
+                        elif response.status in (403, 429):
+                            wait = self._rate_limit_wait(response)
+                            self.logger.warning(f"Rate limit hit for '{query}', waiting {wait}s...")
+                            await asyncio.sleep(wait)
+                            continue
+
+                        elif response.status == 422:
+                            # Invalid query, or paging past the 1000-result cap
+                            self.logger.debug(f"422 for '{query}' page {page} (end of results)")
+                            page_items = []
+                            break
+
+                        else:
+                            self.logger.error(f"HTTP {response.status} for '{query}'")
+
+                except Exception as e:
+                    self.logger.error(f"Attempt {attempt + 1} failed for '{query}': {e}")
+                    if attempt < self.config.retry_attempts - 1:
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        self.progress.errors += 1
+
+            # Could not fetch this page after all retries -> stop paging
+            if page_items is None:
+                break
+
+            for item in page_items:
+                repo_url = item["repository"]["html_url"]
+                file_url = item["html_url"]
+
+                # Append .git suffix for clone compatibility
+                if not repo_url.endswith(".git"):
+                    repo_url = repo_url + ".git"
+                repos.add(repo_url)
+
+                # Check file extension
+                if any(file_url.lower().endswith(ext) for ext in self.config.valid_extensions):
+                    urls.add(file_url)
+
+            # Last page reached (short or empty page)
+            if len(page_items) < per_page:
+                break
+
+            # A full page on the final allowed page => results were truncated
+            if page == self.config.max_pages:
+                capped = True
+
+            # Throttle between pages of the same query
+            await asyncio.sleep(60 / self.config.rate_limit)
+
+        return repos, urls, capped
+
+    async def _search_with_splitting(self, base_query: str, ranges, depth: int) -> Tuple[Set[str], Set[str]]:
+        """Run base_query across the given size ranges, subdividing any range
+        that is itself capped (down to max_split_depth)."""
+        repos, urls = set(), set()
+        for low, high in ranges:
+            if self.shutdown_event.is_set():
+                break
+
+            sub_query = f"{base_query} {self._size_q(low, high)}"
+            r, u, capped = await self._search_pages(sub_query)
+            repos |= r
+            urls |= u
+
+            if not capped:
+                continue
+
+            # Still capped: subdivide a finite range one level deeper if allowed
+            if depth < self.config.max_split_depth and low is not None and high is not None and high - low >= 2:
+                mid = (low + high) // 2
+                deeper = await self._search_with_splitting(
+                    base_query, [(low, mid), (mid + 1, high)], depth + 1
+                )
+                repos |= deeper[0]
+                urls |= deeper[1]
+            else:
+                self.logger.warning(f"Query still capped after size split: '{sub_query}'")
+
+        return repos, urls
+
+    async def search_github(self, keyword: str, dork: str) -> Tuple[Set[str], Set[str]]:
+        """Search GitHub with retry, pagination, and size-based query splitting.
+
+        The code-search API returns at most 100 results per page and 1000 total.
+        When a query saturates that cap, we re-run it partitioned by file size so
+        each sub-query gets its own 1000 ceiling, recovering results that the cap
+        would otherwise hide.
         """
         async with self.semaphore:
-            query = f"{keyword} {dork}"
-            repos, urls = set(), set()
-            per_page = 100
+            base_query = f"{keyword} {dork}"
+            repos, urls, capped = await self._search_pages(base_query)
 
-            for page in range(1, self.config.max_pages + 1):
-                if self.shutdown_event.is_set():
-                    break
-
-                page_items = None  # None = page could not be fetched
-
-                for attempt in range(self.config.retry_attempts):
-                    try:
-                        params = {"q": query, "per_page": per_page, "page": page}
-
-                        async with self.session.get(self.config.base_url, params=params) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                page_items = data.get("items", [])
-                                break
-
-                            elif response.status in (403, 429):
-                                wait = self._rate_limit_wait(response)
-                                self.logger.warning(f"Rate limit hit for '{query}', waiting {wait}s...")
-                                await asyncio.sleep(wait)
-                                continue
-
-                            elif response.status == 422:
-                                # Invalid query, or paging past the 1000-result cap
-                                self.logger.debug(f"422 for '{query}' page {page} (end of results)")
-                                page_items = []
-                                break
-
-                            else:
-                                self.logger.error(f"HTTP {response.status} for '{query}'")
-
-                    except Exception as e:
-                        self.logger.error(f"Attempt {attempt + 1} failed for '{query}': {e}")
-                        if attempt < self.config.retry_attempts - 1:
-                            await asyncio.sleep(2 ** attempt)
-                        else:
-                            self.progress.errors += 1
-
-                # Could not fetch this page after all retries -> stop paging
-                if page_items is None:
-                    break
-
-                for item in page_items:
-                    repo_url = item["repository"]["html_url"]
-                    file_url = item["html_url"]
-
-                    # Append .git suffix for clone compatibility
-                    if not repo_url.endswith(".git"):
-                        repo_url = repo_url + ".git"
-                    repos.add(repo_url)
-
-                    # Check file extension
-                    if any(file_url.lower().endswith(ext) for ext in self.config.valid_extensions):
-                        urls.add(file_url)
-
-                # Last page reached (short or empty page)
-                if len(page_items) < per_page:
-                    break
-
-                # Throttle between pages of the same query
-                await asyncio.sleep(60 / self.config.rate_limit)
+            # Only split when capped, splitting is enabled, and the query doesn't
+            # already constrain size (which would conflict with our qualifier).
+            if capped and self.config.split_on_cap and "size:" not in base_query.lower():
+                self.logger.info(f"Query hit 1000-result cap, splitting by size: '{base_query}'")
+                sr, su = await self._search_with_splitting(base_query, self._SIZE_BUCKETS, 0)
+                repos |= sr
+                urls |= su
 
             # Throttle between queries
             await asyncio.sleep(60 / self.config.rate_limit)
