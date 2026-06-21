@@ -18,6 +18,51 @@ _ENV = Environment(
 )
 
 
+def _http_only(url) -> str:
+    """Return the URL if it is an http(s) link, else '#'."""
+    if isinstance(url, str) and url.startswith(("https://", "http://")):
+        return url
+    return "#"
+
+
+def _truncate(value, limit: int = 240) -> str:
+    """Stringify and cap a value so a huge line can't blow up the report."""
+    s = "" if value is None else str(value)
+    return s if len(s) <= limit else s[:limit] + " …(truncated)"
+
+
+def _extract_secret(finding: dict) -> dict:
+    """Pull the matched secret value + context out of the scanner's raw JSON.
+
+    Handles both Gitleaks (Secret/Match/StartLine/Link) and TruffleHog
+    (Raw/RawV2/Redacted + SourceMetadata) output shapes. The raw value is
+    captured during scanning but was never surfaced in the report before.
+    """
+    try:
+        data = json.loads(finding.get("raw_result", "") or "")
+    except (json.JSONDecodeError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    secret = data.get("Secret") or data.get("Raw") or data.get("RawV2") or data.get("Redacted") or ""
+    match = data.get("Match") or data.get("Line") or ""
+    line_no = data.get("StartLine")
+    if line_no is None:
+        line_no = (
+            (data.get("SourceMetadata") or {}).get("Data", {}).get("Git", {}).get("line")
+        )
+    link = data.get("Link") or ""
+
+    return {
+        "secret": _truncate(secret),
+        "match": _truncate(match),
+        "line_no": line_no if isinstance(line_no, (int, str)) and str(line_no).strip() not in ("", "None") else None,
+        "secret_link_href": _http_only(link),
+        "has_link": bool(link),
+    }
+
+
 def _finding_view(idx: int, finding: dict) -> dict:
     """Build a template-safe view model for one finding.
 
@@ -44,9 +89,33 @@ def _finding_view(idx: int, finding: dict) -> dict:
     else:
         repo_url_href = "#"
 
+    suppressed = bool(finding.get("suppressed"))
+
+    # AI assessment vs. error: a 429/quota failure (or legacy "AI error:" blob)
+    # is shown as a short muted note, never as an assessment.
     ai = finding.get("ai_analysis") or {}
+    ai_reason = ai.get("reason") if ai else None
+    ai_error = bool(ai.get("error"))
+    if ai_reason and str(ai_reason).startswith("AI error"):  # legacy results
+        ai_error = True
+        low = ai_reason.lower()
+        if "429" in ai_reason or "quota" in low or "rate limit" in low:
+            ai_reason = "AI triage skipped: Gemini rate limit / quota exceeded"
+        else:
+            ai_reason = "AI triage skipped: analysis failed"
+
+    secret = _extract_secret(finding)
     return {
         "idx": idx,
+        "suppressed": suppressed,
+        "suppressed_attr": str(suppressed).lower(),
+        "suppressed_by": finding.get("suppressed_by", ""),
+        "secret": secret["secret"],
+        "match": secret["match"],
+        "line_no": secret["line_no"],
+        "secret_link_href": secret["secret_link_href"],
+        "has_secret_link": secret["has_link"],
+        "ai_error": ai_error,
         "detector_name": finding.get("detector_name", "Unknown Detector"),
         "detector_type": finding.get("detector_type", "Unknown Type"),
         "severity": severity_raw.lower(),
@@ -67,7 +136,7 @@ def _finding_view(idx: int, finding: dict) -> dict:
         "tool_class": tool_class,
         "tool_text": tool_text,
         "tool_data": tool_data,
-        "ai_reason": ai.get("reason") if ai else None,
+        "ai_reason": ai_reason,
     }
 
 
@@ -96,23 +165,29 @@ class ReportMixin:
         output_dir = Path(results_file).parent
         report_file = output_dir / "report.html"
 
+        # Severity/tool counts reflect *active* findings only — allowlisted
+        # (suppressed) findings are reported separately so they don't inflate
+        # the dashboard while staying auditable.
+        active = [f for f in findings if not f.get("suppressed")]
+
         def sev(level):
-            return sum(1 for f in findings if f.get("severity") == level)
+            return sum(1 for f in active if f.get("severity") == level)
 
         stats = {
             "total": len(findings),
-            "verified": sum(1 for f in findings if f.get("verified")),
-            "false_positives": sum(1 for f in findings if f.get("false_positive")),
-            "needs_review": sum(1 for f in findings if f.get("needs_review")),
+            "suppressed": sum(1 for f in findings if f.get("suppressed")),
+            "verified": sum(1 for f in active if f.get("verified")),
+            "false_positives": sum(1 for f in active if f.get("false_positive")),
+            "needs_review": sum(1 for f in active if f.get("needs_review")),
             "critical": sev("CRITICAL"),
             "high": sev("HIGH"),
             "medium": sev("MEDIUM"),
             "low": sev("LOW"),
-            "by_trufflehog": sum(1 for f in findings
+            "by_trufflehog": sum(1 for f in active
                                  if "trufflehog" in f.get("found_by", [f.get("scan_tool", "")])),
-            "by_gitleaks": sum(1 for f in findings
+            "by_gitleaks": sum(1 for f in active
                                if "gitleaks" in f.get("found_by", [f.get("scan_tool", "")])),
-            "by_both_tools": sum(1 for f in findings if len(f.get("found_by", [])) > 1),
+            "by_both_tools": sum(1 for f in active if len(f.get("found_by", [])) > 1),
         }
 
         template = _ENV.get_template("report.html.j2")

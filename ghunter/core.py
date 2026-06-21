@@ -17,6 +17,7 @@ from .progress import ProgressMixin
 from .search import SearchMixin
 from .scanners import ScanMixin
 from .report import ReportMixin
+from .allowlist import Allowlist
 
 
 class GHunter(UIMixin, DependencyMixin, ProgressMixin, SearchMixin,
@@ -35,6 +36,8 @@ class GHunter(UIMixin, DependencyMixin, ProgressMixin, SearchMixin,
         self.logger = self.setup_logging()
         self.setup_signal_handlers()
         self.gemini_model = None
+        # Empty by default; repo_scan() loads the real rules from .ghunterignore.
+        self.allowlist = Allowlist()
 
         # Initialize Gemini if API key available and the SDK is installed
         if self.config.gemini_api_key and GENAI_AVAILABLE:

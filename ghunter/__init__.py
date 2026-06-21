@@ -26,6 +26,7 @@ colorama.init(autoreset=True)
 load_dotenv()
 
 from .models import Config, ScanProgress, SecretFinding  # noqa: E402
+from .allowlist import Allowlist  # noqa: E402
 from .ui import display_banner  # noqa: E402
 from .core import GHunter  # noqa: E402
 from .cli import build_parser, main  # noqa: E402
@@ -34,6 +35,7 @@ __all__ = [
     "Config",
     "ScanProgress",
     "SecretFinding",
+    "Allowlist",
     "GHunter",
     "display_banner",
     "build_parser",

@@ -100,11 +100,20 @@ Respond in JSON format:
             }
 
         except Exception as e:
+            msg = str(e)
             self.logger.error(f"Gemini analysis error: {e}")
+            # Store a short, clean reason — never the full provider stack trace
+            # (e.g. a 429 quota error is hundreds of lines). The `error` flag
+            # tells the report to render this as a muted note, not an assessment.
+            if "429" in msg or "quota" in msg.lower() or "rate limit" in msg.lower():
+                reason = "AI triage skipped: Gemini rate limit / quota exceeded"
+            else:
+                reason = "AI triage skipped: analysis failed"
             return {
                 "false_positive": False,
                 "needs_review": True,
                 "severity": "UNKNOWN",
-                "reason": f"AI error: {str(e)}"
+                "reason": reason,
+                "error": True,
             }
 

@@ -1,0 +1,32 @@
+# G-Hunter allowlist (.ghunterignore)
+#
+# Findings matching any rule below are SUPPRESSED: they skip AI triage and are
+# hidden from the report dashboard by default (but remain in scan_results.json
+# and viewable via the report's "Show Suppressed" toggle — nothing is deleted).
+#
+# Copy this file to ".ghunterignore" in your working directory and/or into a
+# scan's output directory (outputs/<keyword>/.ghunterignore). Rules from both
+# locations are combined. One rule per line; blank lines and #-comments ignored.
+#
+# Rule kinds:
+#   path:<glob>          fnmatch glob against the finding's file path
+#   fingerprint:<hash>   exact match against the finding's secret_hash
+#   fp:<hash>            alias for fingerprint:
+#   regex:<pattern>      regex searched against the raw finding result
+#   <glob>               a bare line is treated as a path glob (gitignore-style)
+
+# --- Path globs: ignore test/fixture/sample material -----------------------
+**/test/**
+**/tests/**
+**/fixtures/**
+*.example
+*.sample
+**/node_modules/**
+
+# --- Fingerprints: suppress a specific reviewed-and-accepted secret --------
+# (copy the 16-char secret_hash shown for the finding)
+# fingerprint:0123456789abcdef
+
+# --- Regex: suppress obvious placeholder / dummy values --------------------
+regex:EXAMPLE_KEY|DUMMY_SECRET|REPLACE_ME
+regex:AKIA[X]{16}

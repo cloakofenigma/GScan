@@ -145,6 +145,66 @@ def test_report_escapes_xss(hunter, tmp_path):
     assert 'href="#"' in report  # javascript: url neutralized
 
 
+# ------------------------------------------------- secret surfaced in report -
+def _write_results(tmp_path, *rows):
+    rf = tmp_path / "scan_results.json"
+    rf.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return rf
+
+
+def _base_row(**kw):
+    row = {
+        "detector_type": "generic-api-key", "detector_name": "Generic API Key",
+        "verified": False, "repo_url": "https://github.com/a/b", "file_path": "cfg",
+        "commit": "c", "timestamp": "t", "severity": "MEDIUM",
+        "false_positive": False, "needs_review": True, "ai_analysis": None,
+        "raw_result": "{}", "scan_tool": "gitleaks", "found_by": ["gitleaks"],
+        "suppressed": False, "suppressed_by": "",
+    }
+    row.update(kw)
+    return row
+
+
+def test_report_shows_gitleaks_secret(hunter, tmp_path):
+    raw = json.dumps({"Secret": "16Bincyshalu", "Match": 'password: "16Bincyshalu"',
+                      "StartLine": 19, "Link": "https://github.com/a/b/blob/c/cfg#L19"})
+    rf = _write_results(tmp_path, _base_row(raw_result=raw))
+    hunter.generate_html_report(str(rf))
+    html = (tmp_path / "report.html").read_text()
+    assert "16Bincyshalu" in html              # secret value surfaced
+    assert "Identified Secret" in html
+    assert "secret-value masked" in html       # masked by default
+    assert "line 19" in html
+    assert 'href="https://github.com/a/b/blob/c/cfg#L19"' in html
+
+
+def test_report_shows_trufflehog_secret(hunter, tmp_path):
+    raw = json.dumps({"Raw": "AKIAIOSFODNN7EXAMPLE", "DetectorName": "AWS"})
+    rf = _write_results(tmp_path, _base_row(scan_tool="trufflehog",
+                                            found_by=["trufflehog"], raw_result=raw))
+    hunter.generate_html_report(str(rf))
+    assert "AKIAIOSFODNN7EXAMPLE" in (tmp_path / "report.html").read_text()
+
+
+def test_report_ai_quota_error_is_clean_note(hunter, tmp_path):
+    # Legacy-style result: full 429 blob stored as the reason, no error flag.
+    blob = ("AI error: 429 You exceeded your current quota ... "
+            "generate_content_free_tier_requests quota_metric violations")
+    rf = _write_results(tmp_path, _base_row(ai_analysis={"reason": blob, "severity": "UNKNOWN"}))
+    hunter.generate_html_report(str(rf))
+    html = (tmp_path / "report.html").read_text()
+    assert "AI triage skipped" in html
+    assert "generate_content_free_tier" not in html  # blob suppressed
+    assert "quota_metric" not in html
+
+
+def test_report_long_secret_truncated(hunter, tmp_path):
+    raw = json.dumps({"Secret": "A" * 1000})
+    rf = _write_results(tmp_path, _base_row(raw_result=raw))
+    hunter.generate_html_report(str(rf))
+    assert "(truncated)" in (tmp_path / "report.html").read_text()
+
+
 # ------------------------------------------ concurrent repo_scan + resume ----
 def _setup_hunter(workers=4):
     h = gh.GHunter(gh.Config(github_token="x", max_repo_workers=workers))
@@ -189,6 +249,95 @@ def test_repo_scan_concurrent_and_resume(tmp_path):
     assert calls == ["https://github.com/org/repo3.git"]
     lines2 = [x for x in (tmp_path / "scan_results.json").read_text().splitlines() if x.strip()]
     assert len(lines2) == 5  # no duplicates
+
+
+# ----------------------------------------------------------- allowlist -------
+def _allowlist(tmp_path, text):
+    f = tmp_path / ".ghunterignore"
+    f.write_text(text)
+    return gh.Allowlist.load([f])
+
+
+def test_allowlist_path_glob(tmp_path):
+    al = _allowlist(tmp_path, "path:**/test/**\n*.example\n")
+    assert al.match(make_finding(file="src/test/fixtures/a.py"))
+    assert al.match(make_finding(file="config.example"))
+    assert al.match(make_finding(file="src/main.py")) is None
+
+
+def test_allowlist_bare_line_is_path_glob(tmp_path):
+    al = _allowlist(tmp_path, "# comment\n\n**/node_modules/**\n")
+    assert al.match(make_finding(file="a/node_modules/x/key.js"))
+    assert al.match(make_finding(file="a/src/key.js")) is None
+
+
+def test_allowlist_fingerprint(tmp_path):
+    al = _allowlist(tmp_path, "fingerprint:deadbeef\nfp:cafef00d\n")
+    assert al.match(make_finding(hash="deadbeef")) == "fingerprint:deadbeef"
+    assert al.match(make_finding(hash="cafef00d")) == "fingerprint:cafef00d"
+    assert al.match(make_finding(hash="other")) is None
+    assert al.match(make_finding(hash="")) is None  # never match empty hash
+
+
+def test_allowlist_regex(tmp_path):
+    al = _allowlist(tmp_path, "regex:DUMMY_SECRET|REPLACE_ME\n")
+    assert al.match(make_finding(raw='{"Raw":"DUMMY_SECRET"}'))
+    assert al.match(make_finding(raw='{"Raw":"real"}')) is None
+
+
+def test_allowlist_invalid_regex_is_skipped_not_fatal(tmp_path):
+    al = _allowlist(tmp_path, "regex:[unclosed\npath:keep.py\n")
+    assert len(al) == 1  # bad regex dropped, valid path rule kept
+    assert al.match(make_finding(file="keep.py"))
+
+
+def test_allowlist_missing_file_is_empty(tmp_path):
+    al = gh.Allowlist.load([tmp_path / "nope"])
+    assert not al and len(al) == 0
+
+
+def test_scan_single_repo_tags_suppressed_and_skips_ai(hunter, tmp_path, monkeypatch):
+    hunter.allowlist = _allowlist(tmp_path, "path:*.example\n")
+    monkeypatch.setattr(hunter, "clone_repository", lambda url, d: (True, tmp_path / "r"))
+    monkeypatch.setattr(hunter, "_register_clone", lambda p: None)
+    monkeypatch.setattr(hunter, "_unregister_clone", lambda p: None)
+    monkeypatch.setattr(hunter, "cleanup_clone", lambda p: None)
+    monkeypatch.setattr(hunter, "run_trufflehog_local",
+                        lambda c, u: [make_finding(file="config.example"),
+                                      make_finding(file="real.py")])
+    ai_calls = []
+    hunter.gemini_model = object()
+    monkeypatch.setattr(hunter, "analyze_with_gemini",
+                        lambda f: ai_calls.append(f) or {"false_positive": False})
+
+    out = hunter._scan_single_repo("https://github.com/a/b", tmp_path, "trufflehog", True, False)
+    suppressed = [f for f in out if f.suppressed]
+    assert len(suppressed) == 1 and suppressed[0].file_path == "config.example"
+    assert suppressed[0].suppressed_by == "path:*.example"
+    # AI ran only for the non-suppressed finding
+    assert len(ai_calls) == 1 and ai_calls[0].file_path == "real.py"
+
+
+def test_report_separates_suppressed(hunter, tmp_path):
+    rf = tmp_path / "scan_results.json"
+    rows = [
+        {"detector_type": "t", "detector_name": "n", "verified": True, "repo_url": "https://x/y",
+         "file_path": "real.py", "commit": "c", "timestamp": "t", "severity": "CRITICAL",
+         "false_positive": False, "needs_review": False, "ai_analysis": None,
+         "raw_result": "x", "scan_tool": "trufflehog", "found_by": ["trufflehog"],
+         "suppressed": False, "suppressed_by": ""},
+        {"detector_type": "t", "detector_name": "n", "verified": True, "repo_url": "https://x/y",
+         "file_path": "test.example", "commit": "c", "timestamp": "t", "severity": "CRITICAL",
+         "false_positive": False, "needs_review": False, "ai_analysis": None,
+         "raw_result": "x", "scan_tool": "trufflehog", "found_by": ["trufflehog"],
+         "suppressed": True, "suppressed_by": "path:*.example"},
+    ]
+    rf.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    hunter.generate_html_report(str(rf))
+    report = (tmp_path / "report.html").read_text()
+    # Suppressed finding excluded from active severity counts (1 critical, not 2)
+    assert 'data-suppressed="true"' in report
+    assert "Allowlisted" in report
 
 
 # ----------------------------------------------------------- CLI parser ------

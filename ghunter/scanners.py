@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 from tqdm import tqdm
 from colorama import Fore, Style
 from .models import ScanProgress, SecretFinding
+from .allowlist import Allowlist
 
 class ScanMixin:
     """Cloning and scanning mixed into GHunter."""
@@ -330,11 +331,25 @@ class ScanMixin:
         for finding in repo_findings:
             finding.severity = self.derive_severity(finding)
 
+        # Allowlist: tag (don't drop) findings matching .ghunterignore rules so
+        # they skip AI triage and stay out of the active dashboard, while
+        # remaining auditable in the results file.
+        allowlist = getattr(self, "allowlist", None)
+        if allowlist:
+            for finding in repo_findings:
+                rule = allowlist.match(finding)
+                if rule:
+                    finding.suppressed = True
+                    finding.suppressed_by = rule
+
         # Optional AI triage refines severity and flags false positives
+        # (suppressed findings are skipped — saves Gemini calls).
         if self.gemini_model and repo_findings:
             for finding in repo_findings:
                 if self.shutdown_event.is_set():
                     break
+                if finding.suppressed:
+                    continue
                 analysis = self.analyze_with_gemini(finding)
                 finding.ai_analysis = analysis
                 finding.false_positive = analysis.get('false_positive', False)
@@ -420,6 +435,16 @@ class ScanMixin:
         repo_path = Path(repo_file)
         output_dir = repo_path.parent
 
+        # Load allowlist rules (cwd + per-output-dir .ghunterignore). Used by
+        # _scan_single_repo to suppress known false positives before AI/report.
+        self.allowlist = Allowlist.load(
+            [Path(self.config.allowlist_file), output_dir / self.config.allowlist_file],
+            logger=self.logger,
+        )
+        if self.allowlist:
+            print(f"{Fore.CYAN}Allowlist: loaded {len(self.allowlist)} "
+                  f"rule(s) from {self.config.allowlist_file}{Style.RESET_ALL}")
+
         # Create clones directory
         clone_dir = output_dir / self.config.clone_dir
         clone_dir.mkdir(parents=True, exist_ok=True)
@@ -468,7 +493,9 @@ class ScanMixin:
                 'ai_analysis': finding.ai_analysis,
                 'raw_result': finding.raw_result,
                 'scan_tool': finding.scan_tool,
-                'found_by': finding.found_by
+                'found_by': finding.found_by,
+                'suppressed': finding.suppressed,
+                'suppressed_by': finding.suppressed_by
             })
 
         # Concurrency: clone+scan each repo in a worker thread (off the event
@@ -507,6 +534,8 @@ class ScanMixin:
                             else:
                                 for finding in repo_findings:
                                     self.progress.secrets_found += 1
+                                    if finding.suppressed:
+                                        self.progress.suppressed += 1
                                     if finding.verified:
                                         self.progress.verified_secrets += 1
                                     if finding.false_positive:
@@ -559,6 +588,8 @@ class ScanMixin:
         print(f"\n{Fore.CYAN}Findings Summary:{Style.RESET_ALL}")
         print(f"  Total secrets found: {self.progress.secrets_found}")
         print(f"  Verified secrets: {self.progress.verified_secrets}")
+        if self.progress.suppressed:
+            print(f"  Suppressed (allowlist): {self.progress.suppressed}")
         if scan_tool == "both":
             print(f"  Found by TruffleHog: {found_by_trufflehog}")
             print(f"  Found by Gitleaks: {found_by_gitleaks}")

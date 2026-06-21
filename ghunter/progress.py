@@ -34,6 +34,7 @@ class ProgressMixin:
                 'verified_secrets': self.progress.verified_secrets,
                 'false_positives': self.progress.false_positives,
                 'needs_manual_review': self.progress.needs_manual_review,
+                'suppressed': self.progress.suppressed,
                 'errors': self.progress.errors,
                 'start_time': self.progress.start_time,
                 'completed_repos': list(self.progress.completed_repos),
@@ -66,6 +67,7 @@ class ProgressMixin:
                 progress.verified_secrets = data.get('verified_secrets', 0)
                 progress.false_positives = data.get('false_positives', 0)
                 progress.needs_manual_review = data.get('needs_manual_review', 0)
+                progress.suppressed = data.get('suppressed', 0)
                 progress.errors = data.get('errors', 0)
                 progress.start_time = data.get('start_time', 0)
                 progress.completed_repos = set(data.get('completed_repos', []))

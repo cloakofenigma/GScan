@@ -24,6 +24,7 @@ class Config:
     gitleaks_path: str = "/usr/local/bin/gitleaks"
     clone_dir: str = "clones"  # Relative to output directory
     scan_timeout: int = 600  # 10 minutes per repo scan
+    allowlist_file: str = ".ghunterignore"  # Rule file to suppress known false positives
 
     def __post_init__(self):
         if self.valid_extensions is None:
@@ -45,6 +46,7 @@ class ScanProgress:
     verified_secrets: int = 0
     false_positives: int = 0
     needs_manual_review: int = 0
+    suppressed: int = 0  # Findings filtered out by the .ghunterignore allowlist
     errors: int = 0
     start_time: float = 0
     completed_repos: Set[str] = None
@@ -84,5 +86,7 @@ class SecretFinding:
     scan_tool: str = ""  # Primary tool that found it: "trufflehog" | "gitleaks"
     found_by: List[str] = field(default_factory=list)  # All tools that found it
     secret_hash: str = ""  # For deduplication (hash of secret value)
+    suppressed: bool = False  # Matched a .ghunterignore allowlist rule
+    suppressed_by: str = ""  # The allowlist rule that matched (for auditing)
 
 # ==================== ASCII BANNER ====================

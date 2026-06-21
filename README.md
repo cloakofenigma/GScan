@@ -172,6 +172,29 @@ outputs/acme.com/
 - AI analysis insights
 - Export-ready for stakeholders
 
+## 🧹 Reducing False Positives (Allowlist)
+
+G-Hunter reads a `.ghunterignore` file to suppress findings you've already
+reviewed (test data, placeholders, sample configs). Suppressed findings **skip
+AI triage** (saving Gemini calls) and are **hidden from the report dashboard by
+default**, but they are *never deleted* — they stay in `scan_results.json` and
+can be revealed with the report's **"Show Suppressed"** toggle, so nothing
+becomes invisible.
+
+Rules are loaded from `.ghunterignore` in the current directory **and** in the
+scan's output directory (`outputs/<keyword>/.ghunterignore`); both are combined.
+Copy [`.ghunterignore.example`](.ghunterignore.example) to get started.
+
+```
+# One rule per line; # for comments
+path:**/test/**          # fnmatch glob against the file path
+*.example                # a bare line is also treated as a path glob
+fingerprint:0123456789abcdef   # exact 16-char secret_hash from a finding
+regex:DUMMY_SECRET|REPLACE_ME  # regex against the raw finding result
+```
+
+Invalid regex rules are logged and skipped — a typo never aborts a scan.
+
 ## 🎯 Best Practices
 
 ### Keyword Selection

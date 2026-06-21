@@ -121,6 +121,7 @@
         .badge-unverified { background: #6c757d; color: white; }
         .badge-false-positive { background: #ffc107; color: #333; }
         .badge-needs-review { background: #fd7e14; color: white; }
+        .badge-suppressed { background: #adb5bd; color: #333; }
         .badge-severity { color: white; }
         .badge-severity.critical { background: #dc3545; }
         .badge-severity.high { background: #fd7e14; }
@@ -144,6 +145,43 @@
             word-break: break-all;
         }
 
+        .secret-detail {
+            background: #fff5f5;
+            border: 1px solid #f5c2c7;
+            border-left: 4px solid #dc3545;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+        }
+        .secret-detail .finding-detail-label { color: #dc3545; }
+        .secret-value {
+            background: #2b2b2b;
+            color: #ff7b72;
+            padding: 10px 12px;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.95em;
+            word-break: break-all;
+            white-space: pre-wrap;
+        }
+        .secret-value.masked {
+            filter: blur(6px);
+            user-select: none;
+            cursor: pointer;
+        }
+        .reveal-btn {
+            margin-left: 10px;
+            padding: 2px 12px;
+            font-size: 0.75em;
+            border: 1px solid #dc3545;
+            background: white;
+            color: #dc3545;
+            border-radius: 4px;
+            cursor: pointer;
+            vertical-align: middle;
+        }
+        .reveal-btn:hover { background: #dc3545; color: white; }
+
         .ai-analysis {
             background: #e7f3ff;
             border-left: 4px solid #007bff;
@@ -151,6 +189,9 @@
             margin-top: 15px;
             border-radius: 5px;
         }
+        .ai-analysis.ai-error { background: #f8f9fa; border-left-color: #adb5bd; }
+        .ai-analysis.ai-error .ai-analysis-title { color: #6c757d; }
+        .ai-note { color: #6c757d; font-style: italic; }
         .ai-analysis-title { font-weight: bold; color: #007bff; margin-bottom: 10px; }
 
         footer {
@@ -205,6 +246,10 @@
                 <div class="stat-value" style="color: #fd7e14;">{{ stats.needs_review }}</div>
             </div>
             <div class="stat-card">
+                <div class="stat-label">Suppressed</div>
+                <div class="stat-value" style="color: #6c757d;">{{ stats.suppressed }}</div>
+            </div>
+            <div class="stat-card">
                 <div class="stat-label" style="color: #6f42c1;">TruffleHog</div>
                 <div class="stat-value" style="color: #6f42c1;">{{ stats.by_trufflehog }}</div>
             </div>
@@ -233,6 +278,7 @@
                 <button class="filter-btn" onclick="filterByType('verified')">Verified Only</button>
                 <button class="filter-btn" onclick="filterByType('false_positive')">Hide False Positives</button>
                 <button class="filter-btn" onclick="filterByType('needs_review')">Needs Review</button>
+                <button class="filter-btn active" onclick="toggleSuppressed()" id="suppressed-btn">Hide Suppressed</button>
             </div>
             <div class="filter-group">
                 <button class="filter-btn active" onclick="filterByTool('all')" id="tool-all">All Tools</button>
@@ -247,6 +293,7 @@
             <div class="finding-card" data-severity="{{ f.severity }}" data-verified="{{ f.verified_attr }}"
                  data-false-positive="{{ f.false_positive_attr }}"
                  data-needs-review="{{ f.needs_review_attr }}"
+                 data-suppressed="{{ f.suppressed_attr }}"
                  data-tool="{{ f.tool_data }}">
                 <div class="finding-header" onclick="toggleFinding({{ f.idx }})">
                     <div class="finding-title">
@@ -258,9 +305,30 @@
                         <span class="badge badge-severity {{ f.severity }}">{{ f.severity_text }}</span>
                         {% if f.false_positive %}<span class="badge badge-false-positive">False Positive</span>{% endif %}
                         {% if f.needs_review %}<span class="badge badge-needs-review">Needs Review</span>{% endif %}
+                        {% if f.suppressed %}<span class="badge badge-suppressed" title="Allowlisted by rule: {{ f.suppressed_by }}">Allowlisted</span>{% endif %}
                     </div>
                 </div>
                 <div class="finding-body" id="finding-{{ f.idx }}">
+                    {% if f.secret or f.match %}
+                    <div class="secret-detail">
+                        <div class="finding-detail-label">
+                            🔑 Identified Secret{% if f.line_no %} <span style="color:#666;font-weight:normal;">(line {{ f.line_no }})</span>{% endif %}
+                            <button class="reveal-btn" id="reveal-{{ f.idx }}" onclick="toggleReveal({{ f.idx }})">Reveal</button>
+                        </div>
+                        {% if f.secret %}
+                        <div class="secret-value masked" id="secret-{{ f.idx }}" onclick="toggleReveal({{ f.idx }})">{{ f.secret }}</div>
+                        {% endif %}
+                        {% if f.match %}
+                        <div class="finding-detail-label" style="margin-top:12px;">Match context</div>
+                        <div class="secret-value masked" id="match-{{ f.idx }}" onclick="toggleReveal({{ f.idx }})">{{ f.match }}</div>
+                        {% endif %}
+                        {% if f.has_secret_link %}
+                        <div style="margin-top:10px;">
+                            <a href="{{ f.secret_link_href }}" target="_blank" rel="noopener noreferrer">View at source ↗</a>
+                        </div>
+                        {% endif %}
+                    </div>
+                    {% endif %}
                     <div class="finding-detail">
                         <div class="finding-detail-label">Repository</div>
                         <div class="finding-detail-value">
@@ -280,9 +348,13 @@
                         <div class="finding-detail-value">{{ f.timestamp }}</div>
                     </div>
                     {% if f.ai_reason %}
-                    <div class="ai-analysis">
+                    <div class="ai-analysis{% if f.ai_error %} ai-error{% endif %}">
                         <div class="ai-analysis-title">🤖 AI Analysis</div>
+                        {% if f.ai_error %}
+                        <p class="ai-note">{{ f.ai_reason }}</p>
+                        {% else %}
                         <p><strong>Assessment:</strong> {{ f.ai_reason }}</p>
+                        {% endif %}
                     </div>
                     {% endif %}
                 </div>
@@ -300,10 +372,21 @@
         let currentSeverityFilter = 'all';
         let currentTypeFilter = null;
         let currentToolFilter = 'all';
+        let hideSuppressed = true;  // Allowlisted findings are hidden by default
 
         function toggleFinding(id) {
             const body = document.getElementById('finding-' + id);
             body.classList.toggle('expanded');
+        }
+
+        function toggleReveal(id) {
+            const btn = document.getElementById('reveal-' + id);
+            const reveal = btn.textContent === 'Reveal';
+            ['secret-' + id, 'match-' + id].forEach(eid => {
+                const el = document.getElementById(eid);
+                if (el) el.classList.toggle('masked', !reveal);
+            });
+            btn.textContent = reveal ? 'Hide' : 'Reveal';
         }
 
         function filterBySeverity(severity) {
@@ -343,6 +426,14 @@
             applyFilters();
         }
 
+        function toggleSuppressed() {
+            hideSuppressed = !hideSuppressed;
+            const btn = document.getElementById('suppressed-btn');
+            btn.textContent = hideSuppressed ? 'Hide Suppressed' : 'Show Suppressed';
+            btn.classList.toggle('active', hideSuppressed);
+            applyFilters();
+        }
+
         function filterFindings() {
             applyFilters();
         }
@@ -369,6 +460,10 @@
 
                 if (currentToolFilter !== 'all') {
                     show = show && card.dataset.tool === currentToolFilter;
+                }
+
+                if (hideSuppressed) {
+                    show = show && card.dataset.suppressed !== 'true';
                 }
 
                 if (searchTerm) {

@@ -10,6 +10,7 @@ from ghunter import (  # noqa: F401
     Config,
     ScanProgress,
     SecretFinding,
+    Allowlist,
     GHunter,
     display_banner,
     build_parser,
