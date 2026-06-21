@@ -8,6 +8,9 @@ class Config:
     """Application configuration"""
     github_token: str
     gemini_api_key: Optional[str] = None
+    # Gemini model for AI triage. Override via GEMINI_MODEL env var. 2.5-flash
+    # has a free tier; older 2.0-flash free quota was reduced to 0.
+    gemini_model: str = "gemini-2.5-flash"
     base_url: str = "https://api.github.com/search/code"
     rate_limit: int = 10  # requests per minute
     max_concurrent: int = 5

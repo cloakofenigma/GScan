@@ -8,7 +8,7 @@ G-Hunter is an enterprise-grade security tool for discovering exposed secrets, A
 
 - **🎯 GitHub Dorking** - Advanced search using 500+ git dorks, with full result pagination
 - **🔐 TruffleHog & Gitleaks** - Clone-first local scanning; TruffleHog verifies live secrets, Gitleaks adds pattern coverage, with automatic dedup when running both
-- **🤖 AI Analysis** - Google Gemini for false-positive reduction; secret values are redacted before being sent off-host by default
+- **🤖 AI Analysis** - Google Gemini (default `gemini-2.5-flash`) for false-positive reduction; secret values are redacted before being sent off-host by default
 - **📊 HTML Reports** - Modern, interactive dashboards with filtering (Jinja2 + autoescape)
 - **💾 Resume Capability** - Never lose progress on interrupted scans
 - **⚡ Concurrent Scanning** - Async GitHub search and bounded-concurrency repo scanning
@@ -62,6 +62,9 @@ GITHUB_TOKEN=ghp_your_github_token_here
 
 # Optional (for AI analysis)
 GEMINI_API_KEY=your_gemini_api_key_here
+
+# Optional - defaults to gemini-2.5-flash (free tier). Override if needed.
+# GEMINI_MODEL=gemini-2.5-flash
 ```
 
 **⚠️ SECURITY WARNING:** Never commit your `.env` file or expose your tokens!

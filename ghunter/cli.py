@@ -59,6 +59,7 @@ def main():
     needs_token = args.command in (None, "scan", "repo")
     github_token = os.getenv("GITHUB_TOKEN")
     gemini_api_key = os.getenv("GEMINI_API_KEY")
+    gemini_model = os.getenv("GEMINI_MODEL")  # optional override of the default
 
     if needs_token and not github_token:
         print(f"{Fore.RED}ERROR: GITHUB_TOKEN environment variable not set!{Style.RESET_ALL}")
@@ -72,6 +73,7 @@ def main():
         github_token=github_token or "",
         gemini_api_key=gemini_api_key,
         ai_send_raw=getattr(args, "ai_send_raw", False),
+        **({"gemini_model": gemini_model} if gemini_model else {}),
     )
 
     hunter = GHunter(config)

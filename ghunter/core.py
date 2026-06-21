@@ -43,8 +43,8 @@ class GHunter(UIMixin, DependencyMixin, ProgressMixin, SearchMixin,
         if self.config.gemini_api_key and GENAI_AVAILABLE:
             try:
                 genai.configure(api_key=self.config.gemini_api_key)
-                self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
-                self.logger.info("Google Gemini AI initialized successfully")
+                self.gemini_model = genai.GenerativeModel(self.config.gemini_model)
+                self.logger.info(f"Google Gemini AI initialized ({self.config.gemini_model})")
             except Exception as e:
                 self.logger.warning(f"Failed to initialize Gemini: {e}")
         elif self.config.gemini_api_key and not GENAI_AVAILABLE:

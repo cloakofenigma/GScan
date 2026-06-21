@@ -340,6 +340,38 @@ def test_report_separates_suppressed(hunter, tmp_path):
     assert "Allowlisted" in report
 
 
+# ------------------------------------------------------- Gemini model cfg ----
+def test_default_gemini_model_is_2_5_flash():
+    assert gh.Config(github_token="x").gemini_model == "gemini-2.5-flash"
+
+
+def test_gemini_model_override():
+    c = gh.Config(github_token="x", gemini_model="gemini-2.5-pro")
+    assert c.gemini_model == "gemini-2.5-pro"
+
+
+def test_ghunter_uses_configured_gemini_model(monkeypatch):
+    """The configured model name must reach the Gemini SDK constructor."""
+    import ghunter.core as core
+    created = {}
+
+    class _FakeGenAI:
+        @staticmethod
+        def configure(**kw):
+            pass
+
+        @staticmethod
+        def GenerativeModel(name):
+            created["name"] = name
+            return object()
+
+    monkeypatch.setattr(core, "genai", _FakeGenAI)
+    monkeypatch.setattr(core, "GENAI_AVAILABLE", True)
+    gh.GHunter(gh.Config(github_token="x", gemini_api_key="k",
+                         gemini_model="gemini-2.5-flash"))
+    assert created["name"] == "gemini-2.5-flash"
+
+
 # ----------------------------------------------------------- CLI parser ------
 def test_cli_parser_subcommands():
     p = gh.build_parser()
