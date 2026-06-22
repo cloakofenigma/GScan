@@ -74,3 +74,5 @@ temp/
 # *.dorks
 
 ROADMAP.md
+/outputs/
+*outputs

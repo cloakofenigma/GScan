@@ -33,6 +33,18 @@ class Config:
     clone_dir: str = "clones"  # Relative to output directory
     scan_timeout: int = 600  # 10 minutes per repo scan
     allowlist_file: str = ".ghunterignore"  # Rule file to suppress known false positives
+    audit_log: bool = True  # Write a structured audit.jsonl trail per scan
+    # Custom rule packs. rules_dir holds conventionally-named configs
+    # (gitleaks.toml, trufflehog.yaml, noseyparker/); the explicit *_config /
+    # *_rules fields override per-tool. None => use each tool's default rules.
+    rules_dir: Optional[str] = None
+    gitleaks_config: Optional[str] = None
+    trufflehog_config: Optional[str] = None
+    noseyparker_rules: Optional[str] = None
+    # Cross-run dedup: remember finding fingerprints so re-scans flag only NEW
+    # secrets. Store lives in the scan's output directory.
+    track_seen: bool = True
+    seen_store_file: str = ".ghunter_seen.json"
 
     def __post_init__(self):
         if self.valid_extensions is None:
@@ -55,6 +67,7 @@ class ScanProgress:
     false_positives: int = 0
     needs_manual_review: int = 0
     suppressed: int = 0  # Findings filtered out by the .ghunterignore allowlist
+    new_secrets: int = 0  # Findings not seen in a previous run (cross-run dedup)
     errors: int = 0
     start_time: float = 0
     completed_repos: Set[str] = None
@@ -96,5 +109,6 @@ class SecretFinding:
     secret_hash: str = ""  # For deduplication (hash of secret value)
     suppressed: bool = False  # Matched a .ghunterignore allowlist rule
     suppressed_by: str = ""  # The allowlist rule that matched (for auditing)
+    previously_seen: bool = False  # Fingerprint seen in a prior run (cross-run dedup)
 
 # ==================== ASCII BANNER ====================

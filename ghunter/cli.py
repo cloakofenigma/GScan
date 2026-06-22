@@ -22,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  ghunter enum -o acme-corp            # all of an org/user's repos + gists\n"
             "  ghunter repo -f outputs/acme.com/repos.txt -t both\n"
             "  ghunter report -i outputs/acme.com/scan_results.json\n"
+            "  ghunter export -i outputs/acme.com/scan_results.json -f sarif --fail-on HIGH\n"
         ),
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
@@ -42,14 +43,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     repo_p = sub.add_parser("repo", help="Deep secret scan of repositories (non-interactive)")
     repo_p.add_argument("-f", "--repos-file", required=True, help="File of repo URLs (one per line)")
-    repo_p.add_argument("-t", "--tool", choices=["trufflehog", "gitleaks", "both"],
-                        default="both", help="Scanner to use")
+    repo_p.add_argument("-t", "--tool",
+                        choices=["trufflehog", "gitleaks", "noseyparker", "both", "all"],
+                        default="both", help="Scanner(s) to use ('all' = all three)")
     repo_p.add_argument("--resume", action="store_true", help="Resume a prior scan")
+    repo_p.add_argument("--rules-dir", help="Dir of custom rule packs "
+                        "(gitleaks.toml / trufflehog.yaml / noseyparker/)")
+    repo_p.add_argument("--no-track-seen", action="store_true",
+                        help="Disable cross-run dedup (don't flag/skip previously-seen secrets)")
     repo_p.add_argument("--ai-send-raw", action="store_true",
                         help="Send raw secret data to Gemini (off by default)")
 
     report_p = sub.add_parser("report", help="Generate an HTML report from scan results")
     report_p.add_argument("-i", "--input", required=True, help="Path to scan_results.json")
+
+    export_p = sub.add_parser("export", help="Export results to SARIF or JSON (CI/SIEM)")
+    export_p.add_argument("-i", "--input", required=True, help="Path to scan_results.json")
+    export_p.add_argument("-f", "--format", choices=["sarif", "json"], default="sarif",
+                          help="Export format (default: sarif)")
+    export_p.add_argument("-o", "--output", help="Output path (default: alongside input)")
+    export_p.add_argument("--fail-on", choices=["LOW", "MEDIUM", "HIGH", "CRITICAL"],
+                          help="Exit non-zero if findings at/above this severity exist (CI gating)")
 
     return parser
 
@@ -81,6 +95,8 @@ def main():
         github_token=github_token or "",
         gemini_api_key=gemini_api_key,
         ai_send_raw=getattr(args, "ai_send_raw", False),
+        rules_dir=getattr(args, "rules_dir", None),
+        track_seen=not getattr(args, "no_track_seen", False),
         **({"gemini_model": gemini_model} if gemini_model else {}),
     )
 
@@ -102,6 +118,11 @@ def main():
                                          resume=args.resume))
         elif args.command == "report":
             hunter.generate_html_report(args.input)
+        elif args.command == "export":
+            gating = hunter.export_results(args.input, fmt=args.format,
+                                           output=args.output, fail_on=args.fail_on)
+            if args.fail_on and gating > 0:
+                sys.exit(2)
         else:
             asyncio.run(hunter.run())
     except KeyboardInterrupt:

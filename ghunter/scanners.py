@@ -2,11 +2,13 @@
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -92,6 +94,34 @@ class ScanMixin:
             self.logger.error(f"Failed to cleanup {clone_path}: {e}")
 
 
+    # Conventional rule-pack filenames looked up under config.rules_dir
+    _RULE_PACK_FILES = {
+        "gitleaks": ["gitleaks.toml", ".gitleaks.toml"],
+        "trufflehog": ["trufflehog.yaml", "trufflehog.yml", "trufflehog.json"],
+        "noseyparker": ["noseyparker", "noseyparker_rules"],
+    }
+
+    def _rule_pack(self, tool: str) -> Optional[str]:
+        """Resolve a custom rule-pack path for a tool, or None for defaults.
+
+        An explicit per-tool config wins; otherwise look for a conventionally
+        named file/dir under config.rules_dir.
+        """
+        explicit = {
+            "gitleaks": self.config.gitleaks_config,
+            "trufflehog": self.config.trufflehog_config,
+            "noseyparker": self.config.noseyparker_rules,
+        }.get(tool)
+        if explicit and os.path.exists(explicit):
+            return explicit
+        if not self.config.rules_dir:
+            return None
+        for name in self._RULE_PACK_FILES.get(tool, []):
+            candidate = os.path.join(self.config.rules_dir, name)
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
     def run_trufflehog_local(self, clone_path: Path, repo_url: str) -> List[SecretFinding]:
         """Run TruffleHog scan on a local clone using file:// protocol"""
         findings = []
@@ -101,8 +131,12 @@ class ScanMixin:
             file_url = f"file://{clone_path.absolute()}"
 
             self.logger.info(f"Running TruffleHog on {clone_path}")
+            cmd = ['trufflehog', 'git', file_url, '--json', '--no-update']
+            config_path = self._rule_pack("trufflehog")
+            if config_path:
+                cmd += ['--config', config_path]
             result = subprocess.run(
-                ['trufflehog', 'git', file_url, '--json', '--no-update'],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=self.config.scan_timeout
@@ -171,6 +205,9 @@ class ScanMixin:
             '--report-path', str(output_file),
             '-v',
         ]
+        config_path = self._rule_pack("gitleaks")
+        if config_path:
+            common += ['--config', config_path]
         if self._gitleaks_use_git_subcmd:
             return ['gitleaks', 'git', str(clone_path)] + common
         return ['gitleaks', 'detect', '--source', str(clone_path)] + common
@@ -245,6 +282,120 @@ class ScanMixin:
 
         return findings
 
+    @staticmethod
+    def _np_provenance(provenance) -> Tuple[str, str]:
+        """Extract (file_path, commit) from a NoseyParker match provenance list."""
+        for p in provenance or []:
+            if not isinstance(p, dict):
+                continue
+            if p.get("path"):                       # filesystem provenance
+                return str(p["path"]), ""
+            first_commit = p.get("first_commit") or {}
+            blob_path = first_commit.get("blob_path")
+            commit = (first_commit.get("commit_metadata") or {}).get("commit_id", "")
+            if blob_path:
+                return str(blob_path), str(commit)
+        return "", ""
+
+    def parse_noseyparker_results(self, json_text: str, repo_url: str) -> List[SecretFinding]:
+        """Parse `noseyparker report --format json` output into SecretFindings."""
+        findings: List[SecretFinding] = []
+        try:
+            data = json.loads(json_text)
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to parse NoseyParker JSON: {e}")
+            return findings
+        if not isinstance(data, list):
+            return findings
+
+        for finding in data:
+            if not isinstance(finding, dict):
+                continue
+            rule = finding.get("rule_name", "Unknown")
+            rule_id = finding.get("rule_text_id", rule)
+            for match in finding.get("matches", []):
+                snippet = match.get("snippet", {}) or {}
+                secret = snippet.get("matching") or ""
+                if isinstance(secret, dict):  # some versions wrap bytes
+                    secret = secret.get("bytes", "") or ""
+                secret = str(secret)
+                file_path, commit = self._np_provenance(match.get("provenance", []))
+                line = (((match.get("location") or {}).get("source_span") or {})
+                        .get("start") or {}).get("line")
+                secret_hash = hashlib.sha256(secret.encode()).hexdigest()[:16] if secret else ""
+                # Synthesize a gitleaks-like raw_result so the report's secret
+                # extraction and entropy calibration work uniformly across tools.
+                raw = json.dumps({"Secret": secret, "Match": secret,
+                                  "StartLine": line, "RuleID": rule})
+                findings.append(SecretFinding(
+                    detector_type=rule_id,
+                    detector_name=rule,
+                    verified=False,
+                    raw_result=raw,
+                    repo_url=repo_url,
+                    file_path=file_path or "Unknown",
+                    commit=commit or "Unknown",
+                    timestamp=datetime.now().isoformat(),
+                    scan_tool="noseyparker",
+                    found_by=["noseyparker"],
+                    secret_hash=secret_hash,
+                ))
+        return findings
+
+    def run_noseyparker_local(self, clone_path: Path, repo_url: str) -> List[SecretFinding]:
+        """Run NoseyParker on a local clone (fast, scans full git history)."""
+        findings: List[SecretFinding] = []
+        datastore = clone_path.parent / f"{clone_path.name}_np_ds"
+        try:
+            scan_cmd = ['noseyparker', 'scan', '--datastore', str(datastore), str(clone_path)]
+            rules = self._rule_pack("noseyparker")
+            if rules:
+                scan_cmd += ['--rules', rules]
+
+            self.logger.info(f"Running NoseyParker on {clone_path}")
+            subprocess.run(scan_cmd, capture_output=True, text=True,
+                           timeout=self.config.scan_timeout)
+
+            report = subprocess.run(
+                ['noseyparker', 'report', '--datastore', str(datastore), '--format', 'json'],
+                capture_output=True, text=True, timeout=self.config.scan_timeout
+            )
+            if report.stdout:
+                findings = self.parse_noseyparker_results(report.stdout, repo_url)
+        except subprocess.TimeoutExpired:
+            self.logger.warning(f"NoseyParker timeout for {clone_path}")
+        except Exception as e:
+            self.logger.error(f"NoseyParker error for {clone_path}: {e}")
+        finally:
+            if datastore.exists():
+                shutil.rmtree(datastore, ignore_errors=True)
+        return findings
+
+    @staticmethod
+    def _finding_key(finding: SecretFinding) -> str:
+        """Stable cross-run fingerprint key (matches the dedup key)."""
+        return f"{finding.repo_url}:{finding.file_path}:{finding.secret_hash}"
+
+    def load_seen_store(self, output_dir: Path) -> dict:
+        """Load the cross-run fingerprint store (key -> first-seen timestamp)."""
+        path = Path(output_dir) / self.config.seen_store_file
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                if isinstance(data, dict):
+                    return data
+            except Exception as e:
+                self.logger.warning(f"Could not read seen store: {e}")
+        return {}
+
+    def save_seen_store(self, output_dir: Path, store: dict):
+        """Persist the cross-run fingerprint store."""
+        path = Path(output_dir) / self.config.seen_store_file
+        try:
+            path.write_text(json.dumps(store))
+        except Exception as e:
+            self.logger.warning(f"Could not write seen store: {e}")
+
     # Detector hints that indicate a high-impact credential class
     _HIGH_SIGNAL = (
         "aws", "gcp", "azure", "rsa", "ssh", "private", "stripe", "github",
@@ -252,19 +403,68 @@ class ScanMixin:
         "database", "connectionstring", "twilio", "sendgrid", "npm", "pgp",
     )
 
-    def derive_severity(self, finding: SecretFinding) -> str:
-        """Deterministic severity, independent of the optional AI step.
+    @staticmethod
+    def _shannon_entropy(value: str) -> float:
+        """Shannon entropy (bits/char) of a string — proxy for randomness."""
+        if not value:
+            return 0.0
+        counts = Counter(value)
+        n = len(value)
+        return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
-        Ensures the report's severity dashboard is meaningful even when Gemini
-        is not configured. A verified (live) secret is always CRITICAL.
+    def _finding_entropy(self, finding: SecretFinding):
+        """Entropy of the matched secret: Gitleaks reports it; else compute it.
+
+        Returns None when no secret value is available (so calibration is only
+        applied when there is real signal to calibrate on).
+        """
+        try:
+            data = json.loads(finding.raw_result)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        ent = data.get("Entropy")
+        if isinstance(ent, (int, float)):
+            return float(ent)
+        secret = data.get("Secret") or data.get("Raw") or data.get("RawV2") or ""
+        return self._shannon_entropy(secret) if secret else None
+
+    # Entropy thresholds (bits/char): below LOW looks like a word/placeholder;
+    # at/above HIGH looks like a random credential.
+    _ENTROPY_LOW = 3.0
+    _ENTROPY_HIGH = 4.5
+
+    def derive_severity(self, finding: SecretFinding) -> str:
+        """Deterministic, calibrated severity, independent of the optional AI step.
+
+        Signals: verification status, detector class, and secret entropy. Ensures
+        the dashboard is meaningful without Gemini. A verified secret is always
+        CRITICAL; entropy refines generic/high-signal detectors so low-entropy
+        placeholders are demoted and high-entropy values are promoted.
         """
         if finding.verified:
             return "CRITICAL"
+
         name = f"{finding.detector_type} {finding.detector_name}".lower()
+        entropy = self._finding_entropy(finding)
+
         if "private" in name and "key" in name:
             return "HIGH"
+
         if any(k in name for k in self._HIGH_SIGNAL):
+            # High-signal detector, but a very low-entropy match is likely a
+            # placeholder (e.g. password="changeme") -> demote to MEDIUM.
+            if entropy is not None and entropy < self._ENTROPY_LOW:
+                return "MEDIUM"
             return "HIGH"
+
+        # Generic detector: let entropy decide when we have a value to judge.
+        if entropy is not None:
+            if entropy >= self._ENTROPY_HIGH:
+                return "HIGH"
+            if entropy < self._ENTROPY_LOW:
+                return "LOW"
         return "MEDIUM"
 
     def deduplicate_findings(self, findings: List[SecretFinding]) -> List[SecretFinding]:
@@ -294,7 +494,8 @@ class ScanMixin:
 
     def _scan_single_repo(self, repo_url: str, clone_dir: Path, scan_tool: str,
                           trufflehog_available: bool,
-                          gitleaks_available: bool) -> Optional[List[SecretFinding]]:
+                          gitleaks_available: bool,
+                          noseyparker_available: bool = False) -> Optional[List[SecretFinding]]:
         """Clone, scan, dedup, score, and optionally AI-triage one repository.
 
         Fully synchronous and self-contained so it can run inside a worker
@@ -311,20 +512,23 @@ class ScanMixin:
         self._register_clone(clone_path)
         repo_findings: List[SecretFinding] = []
         try:
-            if scan_tool in ("trufflehog", "both") and trufflehog_available:
+            if scan_tool in ("trufflehog", "both", "all") and trufflehog_available:
                 repo_findings.extend(self.run_trufflehog_local(clone_path, repo_url))
 
-            if scan_tool in ("gitleaks", "both") and gitleaks_available:
+            if scan_tool in ("gitleaks", "both", "all") and gitleaks_available:
                 gl_output = clone_dir / f"{clone_path.name}_gitleaks.json"
                 repo_findings.extend(self.run_gitleaks_local(clone_path, repo_url, gl_output))
                 if gl_output.exists():
                     gl_output.unlink()
+
+            if scan_tool in ("noseyparker", "all") and noseyparker_available:
+                repo_findings.extend(self.run_noseyparker_local(clone_path, repo_url))
         finally:
             self.cleanup_clone(clone_path)
             self._unregister_clone(clone_path)
 
-        # Deduplicate when both tools ran (dedup key includes repo_url)
-        if scan_tool == "both" and repo_findings:
+        # Deduplicate when more than one tool ran (dedup key includes repo_url)
+        if scan_tool in ("both", "all") and repo_findings:
             repo_findings = self.deduplicate_findings(repo_findings)
 
         # Deterministic severity baseline, independent of the optional AI step
@@ -342,13 +546,21 @@ class ScanMixin:
                     finding.suppressed = True
                     finding.suppressed_by = rule
 
-        # Optional AI triage refines severity and flags false positives
-        # (suppressed findings are skipped — saves Gemini calls).
+        # Cross-run dedup: tag findings whose fingerprint was seen in a prior run
+        # (read-only snapshot loaded before the scan, so no thread locking here).
+        seen_keys = getattr(self, "_seen_keys", None)
+        if seen_keys:
+            for finding in repo_findings:
+                if self._finding_key(finding) in seen_keys:
+                    finding.previously_seen = True
+
+        # Optional AI triage refines severity and flags false positives.
+        # Suppressed and previously-seen findings are skipped — saves Gemini calls.
         if self.gemini_model and repo_findings:
             for finding in repo_findings:
                 if self.shutdown_event.is_set():
                     break
-                if finding.suppressed:
+                if finding.suppressed or finding.previously_seen:
                     continue
                 analysis = self.analyze_with_gemini(finding)
                 finding.ai_analysis = analysis
@@ -385,35 +597,48 @@ class ScanMixin:
         # Check available tools
         trufflehog_available = self.check_trufflehog()
         gitleaks_available, gitleaks_version = self.check_gitleaks()
+        noseyparker_available, _ = self.check_noseyparker()
 
-        if not trufflehog_available and not gitleaks_available:
+        if not (trufflehog_available or gitleaks_available or noseyparker_available):
             print(f"{Fore.RED}No scanning tools found!{Style.RESET_ALL}")
             print(f"{Fore.YELLOW}Please install at least one of:{Style.RESET_ALL}")
             print("  • TruffleHog: https://github.com/trufflesecurity/trufflehog/releases")
-            print("  • Gitleaks: https://github.com/gitleaks/gitleaks/releases\n")
+            print("  • Gitleaks: https://github.com/gitleaks/gitleaks/releases")
+            print("  • NoseyParker: https://github.com/praetorian-inc/noseyparker/releases\n")
             return
 
         # Tool selection (menu when interactive, else use provided value)
         if scan_tool is None:
             scan_tool = self.display_tool_selection_menu()
-        if scan_tool not in ("trufflehog", "gitleaks", "both"):
+        if scan_tool not in ("trufflehog", "gitleaks", "noseyparker", "both", "all"):
             print(f"{Fore.RED}Invalid scan tool: {scan_tool!r}{Style.RESET_ALL}")
             return
 
         # Validate tool availability based on selection
-        if scan_tool == "trufflehog" and not trufflehog_available:
-            print(f"{Fore.RED}TruffleHog not installed!{Style.RESET_ALL}")
+        single_tool = {
+            "trufflehog": trufflehog_available,
+            "gitleaks": gitleaks_available,
+            "noseyparker": noseyparker_available,
+        }
+        if scan_tool in single_tool and not single_tool[scan_tool]:
+            print(f"{Fore.RED}{scan_tool} not installed!{Style.RESET_ALL}")
             return
-        if scan_tool == "gitleaks" and not gitleaks_available:
-            print(f"{Fore.RED}Gitleaks not installed!{Style.RESET_ALL}")
-            return
-        if scan_tool == "both":
-            if not trufflehog_available:
-                print(f"{Fore.YELLOW}Warning: TruffleHog not available, using Gitleaks only{Style.RESET_ALL}")
-                scan_tool = "gitleaks"
-            elif not gitleaks_available:
-                print(f"{Fore.YELLOW}Warning: Gitleaks not available, using TruffleHog only{Style.RESET_ALL}")
-                scan_tool = "trufflehog"
+
+        if scan_tool in ("both", "all"):
+            available = [name for name, ok in (
+                ("trufflehog", trufflehog_available),
+                ("gitleaks", gitleaks_available),
+                ("noseyparker", noseyparker_available if scan_tool == "all" else False),
+            ) if ok]
+            if not available:
+                print(f"{Fore.RED}None of the requested tools are installed!{Style.RESET_ALL}")
+                return
+            if len(available) == 1:
+                # Only one usable -> degrade to that single tool (no dedup needed)
+                print(f"{Fore.YELLOW}Warning: only {available[0]} available, using it only{Style.RESET_ALL}")
+                scan_tool = available[0]
+            else:
+                print(f"{Fore.CYAN}Scanning with: {', '.join(available)}{Style.RESET_ALL}")
 
         # Get repo file path
         if repo_file is None:
@@ -444,6 +669,18 @@ class ScanMixin:
         if self.allowlist:
             print(f"{Fore.CYAN}Allowlist: loaded {len(self.allowlist)} "
                   f"rule(s) from {self.config.allowlist_file}{Style.RESET_ALL}")
+
+        # Cross-run dedup: load the fingerprint store; _seen_keys is the
+        # read-only snapshot the worker threads check against.
+        if self.config.track_seen:
+            self._seen = self.load_seen_store(output_dir)
+            self._seen_keys = set(self._seen)
+            if self._seen_keys:
+                print(f"{Fore.CYAN}Cross-run dedup: {len(self._seen_keys)} "
+                      f"fingerprint(s) known from prior runs{Style.RESET_ALL}")
+        else:
+            self._seen = None
+            self._seen_keys = None
 
         # Create clones directory
         clone_dir = output_dir / self.config.clone_dir
@@ -478,6 +715,9 @@ class ScanMixin:
         print(f"Clone directory: {clone_dir}")
         print(f"Output directory: {output_dir}\n")
 
+        self._audit("repo_scan_start", output_dir, tool=scan_tool,
+                    repo_count=len(repos), resume=bool(resume))
+
         def serialize(finding: SecretFinding) -> str:
             return json.dumps({
                 'detector_type': finding.detector_type,
@@ -495,7 +735,8 @@ class ScanMixin:
                 'scan_tool': finding.scan_tool,
                 'found_by': finding.found_by,
                 'suppressed': finding.suppressed,
-                'suppressed_by': finding.suppressed_by
+                'suppressed_by': finding.suppressed_by,
+                'previously_seen': finding.previously_seen
             })
 
         # Concurrency: clone+scan each repo in a worker thread (off the event
@@ -524,6 +765,7 @@ class ScanMixin:
                         repo_findings = await asyncio.to_thread(
                             self._scan_single_repo, repo_url, clone_dir, scan_tool,
                             trufflehog_available, gitleaks_available,
+                            noseyparker_available,
                         )
 
                         async with write_lock:
@@ -542,6 +784,12 @@ class ScanMixin:
                                         self.progress.false_positives += 1
                                     if finding.needs_review:
                                         self.progress.needs_manual_review += 1
+                                    # Cross-run dedup: record fingerprint + count new
+                                    if self._seen is not None:
+                                        if not finding.previously_seen:
+                                            self.progress.new_secrets += 1
+                                        self._seen.setdefault(
+                                            self._finding_key(finding), finding.timestamp)
                                     results_out.write(serialize(finding) + '\n')
                                 results_out.flush()
                                 self.progress.scanned_repos.add(repo_url)
@@ -556,6 +804,10 @@ class ScanMixin:
 
         if self.shutdown_event.is_set():
             print(f"\n{Fore.YELLOW}Scan interrupted. Progress saved - resume to continue.{Style.RESET_ALL}")
+
+        # Persist the cross-run fingerprint store
+        if self._seen is not None:
+            self.save_seen_store(output_dir, self._seen)
 
         # Cleanup clones directory if empty
         try:
@@ -590,13 +842,28 @@ class ScanMixin:
         print(f"  Verified secrets: {self.progress.verified_secrets}")
         if self.progress.suppressed:
             print(f"  Suppressed (allowlist): {self.progress.suppressed}")
-        if scan_tool == "both":
+        if self.config.track_seen:
+            print(f"  New (not seen before): {self.progress.new_secrets}")
+        if scan_tool in ("both", "all"):
+            found_by_noseyparker = sum(1 for f in persisted if 'noseyparker' in f.get('found_by', []))
             print(f"  Found by TruffleHog: {found_by_trufflehog}")
             print(f"  Found by Gitleaks: {found_by_gitleaks}")
-            print(f"  Found by Both: {found_by_both}")
+            if scan_tool == "all":
+                print(f"  Found by NoseyParker: {found_by_noseyparker}")
+            print(f"  Found by >1 tool: {found_by_both}")
         if self.gemini_model:
             print(f"  False positives (AI): {self.progress.false_positives}")
             print(f"  Needs manual review: {self.progress.needs_manual_review}")
         print(f"  Errors: {self.progress.errors}")
         print(f"\nResults saved to: {results_file}\n")
+
+        self._audit("repo_scan_complete", output_dir, tool=scan_tool,
+                    repos_scanned=len(self.progress.scanned_repos),
+                    secrets=self.progress.secrets_found,
+                    verified=self.progress.verified_secrets,
+                    suppressed=self.progress.suppressed,
+                    new_secrets=self.progress.new_secrets,
+                    clone_failures=self.progress.clone_failures,
+                    errors=self.progress.errors,
+                    elapsed_seconds=round(elapsed_time, 2))
 

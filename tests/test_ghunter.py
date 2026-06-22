@@ -16,6 +16,7 @@ import pytest
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 import ghunter_pro as gh  # noqa: E402
+import ghunter.export as gh_export  # noqa: E402
 
 
 def make_finding(**kw):
@@ -221,7 +222,7 @@ def test_repo_scan_concurrent_and_resume(tmp_path):
 
     h = _setup_hunter()
 
-    def fake(repo_url, clone_dir, scan_tool, tf, gl):
+    def fake(repo_url, clone_dir, scan_tool, tf, gl, np=False):
         if "repo3" in repo_url:
             return None  # clone failure
         f = make_finding(repo=repo_url, verified="repo1" in repo_url)
@@ -554,6 +555,244 @@ def test_enum_scan_writes_repos_file(tmp_path):
     assert "https://gist.github.com/g1.git" in lines
 
 
+# ----------------------------------------------------- NoseyParker -----------
+def test_parse_noseyparker_git_provenance(hunter):
+    report = json.dumps([{
+        "rule_name": "AWS API Key", "rule_text_id": "np.aws.1",
+        "matches": [{
+            "snippet": {"matching": "AKIAEXAMPLE1234567890"},
+            "location": {"source_span": {"start": {"line": 7}}},
+            "provenance": [{"kind": "git_repo", "first_commit": {
+                "blob_path": "config/aws.txt",
+                "commit_metadata": {"commit_id": "abc123"}}}],
+        }],
+    }])
+    fs = hunter.parse_noseyparker_results(report, "https://github.com/a/b")
+    assert len(fs) == 1
+    f = fs[0]
+    assert f.detector_name == "AWS API Key" and f.detector_type == "np.aws.1"
+    assert f.file_path == "config/aws.txt" and f.commit == "abc123"
+    assert f.scan_tool == "noseyparker" and f.found_by == ["noseyparker"] and f.secret_hash
+    raw = json.loads(f.raw_result)
+    assert raw["Secret"] == "AKIAEXAMPLE1234567890" and raw["StartLine"] == 7
+
+
+def test_parse_noseyparker_filesystem_provenance(hunter):
+    report = json.dumps([{"rule_name": "X", "matches": [
+        {"snippet": {"matching": "s3cr3t"}, "provenance": [{"kind": "file", "path": "a/b.txt"}]}]}])
+    fs = hunter.parse_noseyparker_results(report, "r")
+    assert fs[0].file_path == "a/b.txt"
+
+
+def test_parse_noseyparker_bad_json(hunter):
+    assert hunter.parse_noseyparker_results("not json", "r") == []
+
+
+# --------------------------------------------------- custom rule packs -------
+def test_rule_pack_explicit_override(hunter, tmp_path):
+    cfg = tmp_path / "gl.toml"
+    cfg.write_text("x")
+    hunter.config.gitleaks_config = str(cfg)
+    assert hunter._rule_pack("gitleaks") == str(cfg)
+
+
+def test_rule_pack_from_rules_dir(hunter, tmp_path):
+    rd = tmp_path / "rules"
+    rd.mkdir()
+    (rd / "gitleaks.toml").write_text("x")
+    hunter.config.rules_dir = str(rd)
+    assert hunter._rule_pack("gitleaks").endswith("gitleaks.toml")
+    assert hunter._rule_pack("trufflehog") is None   # not present in dir
+
+
+def test_gitleaks_cmd_includes_custom_config(hunter, tmp_path):
+    cfg = tmp_path / "gl.toml"
+    cfg.write_text("x")
+    hunter.config.gitleaks_config = str(cfg)
+    hunter._gitleaks_use_git_subcmd = True
+    cmd = hunter._build_gitleaks_cmd(Path("/c"), Path("/o.json"))
+    assert "--config" in cmd and str(cfg) in cmd
+
+
+# ----------------------------------------------------- cross-run dedup -------
+def test_scan_single_repo_marks_previously_seen(hunter, tmp_path, monkeypatch):
+    f = make_finding(repo="https://github.com/a/b", file="x.py", hash="HASH")
+    monkeypatch.setattr(hunter, "clone_repository", lambda u, d: (True, tmp_path / "r"))
+    monkeypatch.setattr(hunter, "_register_clone", lambda p: None)
+    monkeypatch.setattr(hunter, "_unregister_clone", lambda p: None)
+    monkeypatch.setattr(hunter, "cleanup_clone", lambda p: None)
+    monkeypatch.setattr(hunter, "run_trufflehog_local", lambda c, u: [f])
+    hunter._seen_keys = {hunter._finding_key(f)}
+    out = hunter._scan_single_repo("https://github.com/a/b", tmp_path, "trufflehog", True, False)
+    assert out[0].previously_seen is True
+
+
+def test_repo_scan_cross_run_new_then_seen(tmp_path):
+    rf = tmp_path / "repos.txt"
+    rf.write_text("https://github.com/o/r1.git\n")
+
+    # Run 1: finding is new; store gets persisted
+    h1 = _setup_hunter()
+
+    def fake1(repo_url, *a):
+        fnd = make_finding(repo=repo_url, file="a.py", hash="H1")
+        fnd.severity = h1.derive_severity(fnd)
+        return [fnd]
+
+    h1._scan_single_repo = fake1
+    asyncio.run(h1.repo_scan(repo_file=str(rf), scan_tool="trufflehog", resume=False))
+    assert h1.progress.new_secrets == 1
+    assert (tmp_path / ".ghunter_seen.json").exists()
+
+    # Run 2: same fingerprint now loaded from the store -> not new
+    h2 = _setup_hunter()
+
+    def fake2(repo_url, *a):
+        fnd = make_finding(repo=repo_url, file="a.py", hash="H1")
+        fnd.severity = h2.derive_severity(fnd)
+        if h2._finding_key(fnd) in (h2._seen_keys or set()):
+            fnd.previously_seen = True
+        return [fnd]
+
+    h2._scan_single_repo = fake2
+    asyncio.run(h2.repo_scan(repo_file=str(rf), scan_tool="trufflehog", resume=False))
+    assert h2.progress.new_secrets == 0
+
+
+def test_repo_scan_track_seen_disabled(tmp_path):
+    rf = tmp_path / "repos.txt"
+    rf.write_text("https://github.com/o/r1.git\n")
+    h = gh.GHunter(gh.Config(github_token="x", max_repo_workers=2, track_seen=False))
+    h.check_git = lambda: True
+    h.check_trufflehog = lambda: True
+    h.check_gitleaks = lambda: (True, "8.20.0")
+    h._scan_single_repo = lambda repo_url, *a: [make_finding(repo=repo_url)]
+    asyncio.run(h.repo_scan(repo_file=str(rf), scan_tool="trufflehog", resume=False))
+    assert not (tmp_path / ".ghunter_seen.json").exists()
+
+
+def test_report_noseyparker_and_seen_badges(hunter, tmp_path):
+    rf = tmp_path / "scan_results.json"
+    rf.write_text(json.dumps({
+        "detector_type": "np.aws.1", "detector_name": "AWS", "verified": False,
+        "repo_url": "https://x/y", "file_path": "a", "commit": "c", "timestamp": "t",
+        "severity": "HIGH", "false_positive": False, "needs_review": False,
+        "ai_analysis": None, "raw_result": "{}", "scan_tool": "noseyparker",
+        "found_by": ["noseyparker"], "suppressed": False, "suppressed_by": "",
+        "previously_seen": True,
+    }) + "\n")
+    hunter.generate_html_report(str(rf))
+    html = (tmp_path / "report.html").read_text()
+    assert "NoseyParker" in html
+    assert 'data-previously-seen="true"' in html
+    assert "Previously Seen" in html
+
+
+# ------------------------------------------------ severity calibration -------
+def test_severity_high_entropy_generic_promoted(hunter):
+    raw = json.dumps({"Secret": "G7xQ!92zPq#1mVkLrTn8Bw", "Entropy": 4.9})
+    assert hunter.derive_severity(make_finding(dt="generic", raw=raw)) == "HIGH"
+
+
+def test_severity_low_entropy_generic_demoted(hunter):
+    raw = json.dumps({"Secret": "aaaaaaaa", "Entropy": 1.0})
+    assert hunter.derive_severity(make_finding(dt="generic", raw=raw)) == "LOW"
+
+
+def test_severity_low_entropy_high_signal_demoted_to_medium(hunter):
+    raw = json.dumps({"Secret": "changeme", "Entropy": 2.0})
+    assert hunter.derive_severity(make_finding(dt="aws-key", raw=raw)) == "MEDIUM"
+
+
+def test_severity_computes_entropy_when_field_absent(hunter):
+    # No Entropy field -> entropy computed from the Secret value (high here)
+    raw = json.dumps({"Secret": "qWeRtY12345!@#$%^&*()ZxCvBnM"})
+    assert hunter.derive_severity(make_finding(dt="generic", raw=raw)) == "HIGH"
+
+
+def test_severity_unchanged_without_value(hunter):
+    # Regression: empty raw -> no entropy signal -> original behavior
+    assert hunter.derive_severity(make_finding(dt="generic-misc")) == "MEDIUM"
+    assert hunter.derive_severity(make_finding(dt="aws-key")) == "HIGH"
+
+
+# --------------------------------------------------- SARIF / JSON export ------
+def _export_rows(tmp_path, *rows):
+    rf = tmp_path / "scan_results.json"
+    rf.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return rf
+
+
+def test_to_sarif_structure():
+    findings = [{
+        "detector_type": "aws-key", "detector_name": "AWS Key", "severity": "CRITICAL",
+        "verified": True, "repo_url": "https://github.com/a/b", "file_path": "cfg",
+        "raw_result": json.dumps({"StartLine": 12}), "found_by": ["gitleaks"],
+    }]
+    doc = gh_export.to_sarif(findings)
+    assert doc["version"] == "2.1.0"
+    run = doc["runs"][0]
+    assert run["tool"]["driver"]["name"] == "G-Hunter"
+    res = run["results"][0]
+    assert res["ruleId"] == "aws-key"
+    assert res["level"] == "error"                      # CRITICAL -> error
+    assert res["locations"][0]["physicalLocation"]["region"]["startLine"] == 12
+
+
+def test_to_sarif_marks_suppressed():
+    findings = [{"detector_type": "t", "severity": "LOW", "file_path": "x",
+                 "raw_result": "{}", "suppressed": True, "suppressed_by": "path:*.example"}]
+    res = gh_export.to_sarif(findings)["runs"][0]["results"][0]
+    assert res["level"] == "note"
+    assert res["suppressions"][0]["kind"] == "external"
+
+
+def test_json_export_envelope():
+    findings = [{"severity": "HIGH", "verified": False, "raw_result": "{}"}]
+    doc = gh_export.to_json_export(findings)
+    assert doc["schema_version"] == "1.0"
+    assert doc["summary"]["high"] == 1 and doc["summary"]["total"] == 1
+    assert doc["findings"] == findings
+
+
+def test_count_at_or_above_excludes_suppressed_and_fp():
+    findings = [
+        {"severity": "CRITICAL"},
+        {"severity": "CRITICAL", "suppressed": True},
+        {"severity": "HIGH", "false_positive": True},
+        {"severity": "MEDIUM"},
+    ]
+    assert gh_export.count_at_or_above(findings, "HIGH") == 1   # only the clean CRITICAL
+    assert gh_export.count_at_or_above(findings, "MEDIUM") == 2
+
+
+def test_export_results_writes_sarif_and_gates(hunter, tmp_path):
+    rf = _export_rows(tmp_path,
+                      {"detector_type": "t", "severity": "CRITICAL", "file_path": "x",
+                       "raw_result": "{}", "verified": True})
+    gating = hunter.export_results(str(rf), fmt="sarif", fail_on="HIGH")
+    out = tmp_path / "scan_results.sarif"
+    assert out.exists()
+    assert json.loads(out.read_text())["version"] == "2.1.0"
+    assert gating == 1   # one CRITICAL at/above HIGH -> CI would exit non-zero
+
+
+# ----------------------------------------------------------- audit log -------
+def test_audit_writes_jsonl(hunter, tmp_path, monkeypatch):
+    monkeypatch.setenv("GHUNTER_ACTOR", "tester")
+    hunter._audit("repo_scan_start", tmp_path, tool="gitleaks", repo_count=3)
+    rec = json.loads((tmp_path / "audit.jsonl").read_text().strip())
+    assert rec["event"] == "repo_scan_start" and rec["actor"] == "tester"
+    assert rec["tool"] == "gitleaks" and rec["repo_count"] == 3
+    assert "timestamp" in rec
+
+
+def test_audit_disabled_writes_nothing(tmp_path):
+    h = gh.GHunter(gh.Config(github_token="x", audit_log=False))
+    h._audit("repo_scan_start", tmp_path, tool="gitleaks")
+    assert not (tmp_path / "audit.jsonl").exists()
+
+
 # ----------------------------------------------------------- CLI parser ------
 def test_cli_parser_subcommands():
     p = gh.build_parser()
@@ -565,5 +804,10 @@ def test_cli_parser_subcommands():
     assert a.command == "enum" and a.owner == "acme" and a.no_gists is False
     a = p.parse_args(["repo", "-f", "repos.txt", "-t", "both"])
     assert a.command == "repo" and a.tool == "both"
+    a = p.parse_args(["repo", "-f", "r.txt", "-t", "all", "--rules-dir", "rules/",
+                      "--no-track-seen"])
+    assert a.tool == "all" and a.rules_dir == "rules/" and a.no_track_seen is True
     a = p.parse_args(["report", "-i", "out.json"])
     assert a.command == "report" and a.input == "out.json"
+    a = p.parse_args(["export", "-i", "out.json", "-f", "sarif", "--fail-on", "HIGH"])
+    assert a.command == "export" and a.format == "sarif" and a.fail_on == "HIGH"

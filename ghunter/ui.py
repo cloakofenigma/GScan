@@ -195,23 +195,28 @@ For issues, questions, or contributions:
 ║     {Fore.WHITE}• Scans entire commit history{Fore.CYAN}                           ║
 ║     {Fore.WHITE}• Good pattern-based detection{Fore.CYAN}                          ║
 ║                                                              ║
-║  {Fore.GREEN}3.{Fore.CYAN} Both        - Maximum coverage (sequential scan)        ║
-║     {Fore.WHITE}• Run both tools on each repository{Fore.CYAN}                     ║
-║     {Fore.WHITE}• Deduplicates findings automatically{Fore.CYAN}                   ║
+║  {Fore.GREEN}3.{Fore.CYAN} NoseyParker - Fast, great on large git histories        ║
+║     {Fore.WHITE}• High-throughput scanning + entropy{Fore.CYAN}                    ║
+║     {Fore.WHITE}• Good for big monorepos / deep history{Fore.CYAN}                 ║
+║                                                              ║
+║  {Fore.GREEN}4.{Fore.CYAN} Both        - TruffleHog + Gitleaks (deduplicated)      ║
+║                                                              ║
+║  {Fore.GREEN}5.{Fore.CYAN} All         - TruffleHog + Gitleaks + NoseyParker       ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}
 """
         print(menu)
 
-        choice = input(f"{Fore.GREEN}Enter your choice [1-3]:{Style.RESET_ALL} ").strip()
+        choice = input(f"{Fore.GREEN}Enter your choice [1-5]:{Style.RESET_ALL} ").strip()
 
-        if choice == "1":
-            return "trufflehog"
-        elif choice == "2":
-            return "gitleaks"
-        elif choice == "3":
-            return "both"
-        else:
+        selection = {
+            "1": "trufflehog",
+            "2": "gitleaks",
+            "3": "noseyparker",
+            "4": "both",
+            "5": "all",
+        }.get(choice)
+        if selection is None:
             print(f"{Fore.RED}Invalid choice!{Style.RESET_ALL}")
-            return None
+        return selection
 

@@ -74,11 +74,13 @@ def _finding_view(idx: int, finding: dict) -> dict:
     found_by = finding.get("found_by", [])
     scan_tool = finding.get("scan_tool", "")
     if len(found_by) > 1:
-        tool_class, tool_text, tool_data = "badge-both", "Both", "both"
+        tool_class, tool_text, tool_data = "badge-both", "Multiple", "both"
     elif "trufflehog" in found_by or scan_tool == "trufflehog":
         tool_class, tool_text, tool_data = "badge-trufflehog", "TruffleHog", "trufflehog"
     elif "gitleaks" in found_by or scan_tool == "gitleaks":
         tool_class, tool_text, tool_data = "badge-gitleaks", "Gitleaks", "gitleaks"
+    elif "noseyparker" in found_by or scan_tool == "noseyparker":
+        tool_class, tool_text, tool_data = "badge-noseyparker", "NoseyParker", "noseyparker"
     else:
         tool_class, tool_text, tool_data = "badge-tool", "Unknown", "unknown"
 
@@ -90,6 +92,7 @@ def _finding_view(idx: int, finding: dict) -> dict:
         repo_url_href = "#"
 
     suppressed = bool(finding.get("suppressed"))
+    previously_seen = bool(finding.get("previously_seen"))
 
     # AI assessment vs. error: a 429/quota failure (or legacy "AI error:" blob)
     # is shown as a short muted note, never as an assessment.
@@ -110,6 +113,8 @@ def _finding_view(idx: int, finding: dict) -> dict:
         "suppressed": suppressed,
         "suppressed_attr": str(suppressed).lower(),
         "suppressed_by": finding.get("suppressed_by", ""),
+        "previously_seen": previously_seen,
+        "previously_seen_attr": str(previously_seen).lower(),
         "secret": secret["secret"],
         "match": secret["match"],
         "line_no": secret["line_no"],
@@ -176,6 +181,8 @@ class ReportMixin:
         stats = {
             "total": len(findings),
             "suppressed": sum(1 for f in findings if f.get("suppressed")),
+            "previously_seen": sum(1 for f in findings if f.get("previously_seen")),
+            "new": sum(1 for f in active if not f.get("previously_seen")),
             "verified": sum(1 for f in active if f.get("verified")),
             "false_positives": sum(1 for f in active if f.get("false_positive")),
             "needs_review": sum(1 for f in active if f.get("needs_review")),
@@ -187,6 +194,8 @@ class ReportMixin:
                                  if "trufflehog" in f.get("found_by", [f.get("scan_tool", "")])),
             "by_gitleaks": sum(1 for f in active
                                if "gitleaks" in f.get("found_by", [f.get("scan_tool", "")])),
+            "by_noseyparker": sum(1 for f in active
+                                  if "noseyparker" in f.get("found_by", [f.get("scan_tool", "")])),
             "by_both_tools": sum(1 for f in active if len(f.get("found_by", [])) > 1),
         }
 

@@ -9,12 +9,16 @@ G-Hunter is an enterprise-grade security tool for discovering exposed secrets, A
 - **🎯 GitHub Dorking** - Advanced search using 500+ git dorks, with full pagination and automatic `size:` query-splitting to recover results beyond GitHub's 1000-per-query cap
 - **🏢 Org/User Enumeration** - List every repo + public gist for an owner via the REST API, bypassing the code-search cap entirely
 - **📜 Commit Search** - Optionally search commit history (`--commits`), catching secrets that file/code search misses
-- **🔐 TruffleHog & Gitleaks** - Clone-first local scanning; TruffleHog verifies live secrets, Gitleaks adds pattern coverage, with automatic dedup when running both
+- **🔐 TruffleHog, Gitleaks & NoseyParker** - Clone-first local scanning; TruffleHog verifies live secrets, Gitleaks adds pattern coverage, NoseyParker is fast on large histories — run any one, `both`, or `all` with automatic dedup
+- **🧩 Custom Rule Packs** - Point `--rules-dir` at your own `gitleaks.toml` / `trufflehog.yaml` / `noseyparker/` rules
+- **♻️ Cross-Run Dedup** - Remembers finding fingerprints so re-scans flag only *new* secrets (continuous-monitoring friendly)
 - **🤖 AI Analysis** - Google Gemini (default `gemini-2.5-flash`) for false-positive reduction; secret values are redacted before being sent off-host by default
 - **📊 HTML Reports** - Modern, interactive dashboards with filtering (Jinja2 + autoescape)
 - **💾 Resume Capability** - Never lose progress on interrupted scans
 - **⚡ Concurrent Scanning** - Async GitHub search and bounded-concurrency repo scanning
-- **🧮 Deterministic Severity** - Reproducible severity classification independent of AI
+- **🧮 Calibrated Severity** - Reproducible, entropy-aware severity independent of AI (demotes placeholders, promotes high-entropy secrets)
+- **📤 SARIF / JSON Export** - Feed GitHub code-scanning, DefectDojo, or SIEMs; `--fail-on` gates CI builds
+- **🧾 Audit Trail** - Structured `audit.jsonl` of who scanned what, when
 - **🤖 Non-Interactive CLI** - Scriptable `scan` / `repo` / `report` subcommands for CI
 - **📁 Organized Output** - Clean directory structure per keyword
 - **🎨 Beautiful UI** - Colored terminal output with progress bars
@@ -28,9 +32,10 @@ G-Hunter is an enterprise-grade security tool for discovering exposed secrets, A
 3. **GitHub Personal Access Token** (PAT)
    - Create at: https://github.com/settings/tokens
    - Required scope: `public_repo`
-4. **TruffleHog and/or Gitleaks** (for deep scanning — at least one)
+4. **A secret scanner** (for deep scanning — at least one)
    - TruffleHog: `brew install trufflehog` / `pip install trufflehog` / [releases](https://github.com/trufflesecurity/trufflehog/releases)
    - Gitleaks: `brew install gitleaks` / [releases](https://github.com/gitleaks/gitleaks/releases)
+   - NoseyParker (optional, fast on large histories): [releases](https://github.com/praetorian-inc/noseyparker/releases)
 5. **Google Gemini API Key** (optional, for AI analysis)
    - Get at: https://makersuite.google.com/app/apikey
 
@@ -104,11 +109,22 @@ python ghunter_pro.py enum -o acme-corp [--no-gists]
 
 # 2. Deep secret scan of discovered repos
 python ghunter_pro.py repo -f outputs/acme.com/repos.txt -t both [--resume]
-#    -t {trufflehog|gitleaks|both}   --ai-send-raw  (opt in to send raw data to Gemini)
+#    -t {trufflehog|gitleaks|noseyparker|both|all}
+#    --rules-dir custom_rules/   (gitleaks.toml / trufflehog.yaml / noseyparker/)
+#    --no-track-seen             (disable cross-run dedup; default flags only NEW secrets)
+#    --ai-send-raw               (opt in to send raw data to Gemini)
 
 # 3. Generate the HTML report (works offline, no token required)
 python ghunter_pro.py report -i outputs/acme.com/scan_results.json
+
+# 4. Export for CI / SIEM (SARIF for GitHub code-scanning, or normalized JSON).
+#    --fail-on exits non-zero when findings at/above the severity exist (CI gate).
+python ghunter_pro.py export -i outputs/acme.com/scan_results.json -f sarif --fail-on HIGH
 ```
+
+Each scan also writes a structured `audit.jsonl` (who/when/what) to its output
+directory; disable with `audit_log=False` in `Config` or set the actor via the
+`GHUNTER_ACTOR` env var (useful in CI).
 
 If installed as a package (`pip install -e .`), the `ghunter` console command is
 equivalent to `python ghunter_pro.py`.

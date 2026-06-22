@@ -130,7 +130,9 @@
         .badge-tool { font-size: 0.75em; padding: 3px 8px; }
         .badge-trufflehog { background: #6f42c1; color: white; }
         .badge-gitleaks { background: #20c997; color: white; }
+        .badge-noseyparker { background: #e83e8c; color: white; }
         .badge-both { background: #17a2b8; color: white; }
+        .badge-seen { background: #6c757d; color: white; }
 
         .finding-body { padding: 20px; display: none; }
         .finding-body.expanded { display: block; }
@@ -250,12 +252,24 @@
                 <div class="stat-value" style="color: #6c757d;">{{ stats.suppressed }}</div>
             </div>
             <div class="stat-card">
+                <div class="stat-label">New</div>
+                <div class="stat-value" style="color: #007bff;">{{ stats.new }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Previously Seen</div>
+                <div class="stat-value" style="color: #6c757d;">{{ stats.previously_seen }}</div>
+            </div>
+            <div class="stat-card">
                 <div class="stat-label" style="color: #6f42c1;">TruffleHog</div>
                 <div class="stat-value" style="color: #6f42c1;">{{ stats.by_trufflehog }}</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label" style="color: #20c997;">Gitleaks</div>
                 <div class="stat-value" style="color: #20c997;">{{ stats.by_gitleaks }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label" style="color: #e83e8c;">NoseyParker</div>
+                <div class="stat-value" style="color: #e83e8c;">{{ stats.by_noseyparker }}</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label" style="color: #17a2b8;">Found by Both</div>
@@ -279,12 +293,14 @@
                 <button class="filter-btn" onclick="filterByType('false_positive')">Hide False Positives</button>
                 <button class="filter-btn" onclick="filterByType('needs_review')">Needs Review</button>
                 <button class="filter-btn active" onclick="toggleSuppressed()" id="suppressed-btn">Hide Suppressed</button>
+                <button class="filter-btn" onclick="toggleSeen()" id="seen-btn">Hide Previously Seen</button>
             </div>
             <div class="filter-group">
                 <button class="filter-btn active" onclick="filterByTool('all')" id="tool-all">All Tools</button>
                 <button class="filter-btn" onclick="filterByTool('trufflehog')" id="tool-trufflehog" style="border-color: #6f42c1;">TruffleHog</button>
                 <button class="filter-btn" onclick="filterByTool('gitleaks')" id="tool-gitleaks" style="border-color: #20c997;">Gitleaks</button>
-                <button class="filter-btn" onclick="filterByTool('both')" id="tool-both" style="border-color: #17a2b8;">Both Tools</button>
+                <button class="filter-btn" onclick="filterByTool('noseyparker')" id="tool-noseyparker" style="border-color: #e83e8c;">NoseyParker</button>
+                <button class="filter-btn" onclick="filterByTool('both')" id="tool-both" style="border-color: #17a2b8;">Multiple</button>
             </div>
         </div>
 
@@ -294,6 +310,7 @@
                  data-false-positive="{{ f.false_positive_attr }}"
                  data-needs-review="{{ f.needs_review_attr }}"
                  data-suppressed="{{ f.suppressed_attr }}"
+                 data-previously-seen="{{ f.previously_seen_attr }}"
                  data-tool="{{ f.tool_data }}">
                 <div class="finding-header" onclick="toggleFinding({{ f.idx }})">
                     <div class="finding-title">
@@ -306,6 +323,7 @@
                         {% if f.false_positive %}<span class="badge badge-false-positive">False Positive</span>{% endif %}
                         {% if f.needs_review %}<span class="badge badge-needs-review">Needs Review</span>{% endif %}
                         {% if f.suppressed %}<span class="badge badge-suppressed" title="Allowlisted by rule: {{ f.suppressed_by }}">Allowlisted</span>{% endif %}
+                        {% if f.previously_seen %}<span class="badge badge-seen" title="Fingerprint seen in a previous run">Previously Seen</span>{% endif %}
                     </div>
                 </div>
                 <div class="finding-body" id="finding-{{ f.idx }}">
@@ -373,6 +391,7 @@
         let currentTypeFilter = null;
         let currentToolFilter = 'all';
         let hideSuppressed = true;  // Allowlisted findings are hidden by default
+        let hideSeen = false;       // Previously-seen findings shown unless toggled
 
         function toggleFinding(id) {
             const body = document.getElementById('finding-' + id);
@@ -413,7 +432,7 @@
 
         function filterByTool(tool) {
             currentToolFilter = tool;
-            ['all', 'trufflehog', 'gitleaks', 'both'].forEach(t => {
+            ['all', 'trufflehog', 'gitleaks', 'noseyparker', 'both'].forEach(t => {
                 const btn = document.getElementById('tool-' + t);
                 if (btn) {
                     if (t === tool) {
@@ -431,6 +450,14 @@
             const btn = document.getElementById('suppressed-btn');
             btn.textContent = hideSuppressed ? 'Hide Suppressed' : 'Show Suppressed';
             btn.classList.toggle('active', hideSuppressed);
+            applyFilters();
+        }
+
+        function toggleSeen() {
+            hideSeen = !hideSeen;
+            const btn = document.getElementById('seen-btn');
+            btn.textContent = hideSeen ? 'Show Previously Seen' : 'Hide Previously Seen';
+            btn.classList.toggle('active', hideSeen);
             applyFilters();
         }
 
@@ -464,6 +491,10 @@
 
                 if (hideSuppressed) {
                     show = show && card.dataset.suppressed !== 'true';
+                }
+
+                if (hideSeen) {
+                    show = show && card.dataset.previouslySeen !== 'true';
                 }
 
                 if (searchTerm) {

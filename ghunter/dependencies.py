@@ -208,6 +208,27 @@ class DependencyMixin:
 
         return False, None
 
+    def check_noseyparker(self) -> Tuple[bool, Optional[str]]:
+        """Check if NoseyParker is installed and return version."""
+        np_path = shutil.which("noseyparker")
+        if not np_path:
+            self.logger.debug("NoseyParker not found in PATH")
+            return False, None
+        try:
+            result = subprocess.run(
+                ['noseyparker', '--version'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                version = result.stdout.strip() or "unknown"
+                self.logger.debug(f"NoseyParker found: {version}")
+                return True, version
+        except Exception as e:
+            self.logger.warning(f"NoseyParker version check failed: {e}")
+        if os.path.isfile(np_path) and os.access(np_path, os.X_OK):
+            return True, "unknown"
+        return False, None
+
     def check_dependencies(self):
         """Check all required dependencies"""
         issues = []
@@ -254,6 +275,13 @@ class DependencyMixin:
             warnings.append("Gitleaks not installed (optional - for Gitleaks scanning)")
         else:
             successes.append(f"Gitleaks installed ({gitleaks_version or 'unknown'})")
+
+        # Check NoseyParker for repo scanning
+        np_installed, np_version = self.check_noseyparker()
+        if not np_installed:
+            warnings.append("NoseyParker not installed (optional - fast scanning of large histories)")
+        else:
+            successes.append(f"NoseyParker installed ({np_version or 'unknown'})")
 
         # Check Gemini API
         if self.config.gemini_api_key:

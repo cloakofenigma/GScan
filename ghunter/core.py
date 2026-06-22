@@ -17,11 +17,13 @@ from .progress import ProgressMixin
 from .search import SearchMixin
 from .scanners import ScanMixin
 from .report import ReportMixin
+from .export import ExportMixin
+from .audit import AuditMixin
 from .allowlist import Allowlist
 
 
 class GHunter(UIMixin, DependencyMixin, ProgressMixin, SearchMixin,
-              ScanMixin, AIMixin, ReportMixin):
+              ScanMixin, AIMixin, ReportMixin, ExportMixin, AuditMixin):
     """Main G-Hunter application class."""
 
     def __init__(self, config: Config):
@@ -38,6 +40,9 @@ class GHunter(UIMixin, DependencyMixin, ProgressMixin, SearchMixin,
         self.gemini_model = None
         # Empty by default; repo_scan() loads the real rules from .ghunterignore.
         self.allowlist = Allowlist()
+        # Cross-run dedup state; repo_scan() populates these from the seen store.
+        self._seen = None
+        self._seen_keys = None
 
         # Initialize Gemini if API key available and the SDK is installed
         if self.config.gemini_api_key and GENAI_AVAILABLE:

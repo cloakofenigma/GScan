@@ -389,6 +389,10 @@ class SearchMixin:
         print(f"Dorks: {len(dorks)} loaded")
         print(f"Output directory: {output_dir}\n")
 
+        self._audit("git_scan_start", output_dir, keywords=keywords,
+                    dork_count=len(dorks), include_commits=include_commits,
+                    resume=bool(resume))
+
         await self.create_session()
 
         try:
@@ -471,6 +475,12 @@ class SearchMixin:
         print(f"  • {repos_file_path}")
         print(f"  • {urls_file_path}\n")
 
+        self._audit("git_scan_complete", output_dir,
+                    repos_found=self.progress.repos_found,
+                    urls_found=self.progress.urls_found,
+                    errors=self.progress.errors,
+                    elapsed_seconds=round(elapsed_time, 2))
+
     async def enum_scan(self, owner: Optional[str] = None,
                         include_gists: bool = True):
         """Enumerate every repo (and optionally gist) for an org/user.
@@ -520,4 +530,7 @@ class SearchMixin:
         print(f"Total (deduplicated): {len(all_repos)}")
         print(f"\nSaved to: {repos_file_path}")
         print(f"\n{Fore.CYAN}Next:{Style.RESET_ALL} python ghunter_pro.py repo -f {repos_file_path} -t both\n")
+
+        self._audit("enum_complete", output_dir, owner=owner,
+                    repos=len(repos), gists=len(gists), total=len(all_repos))
 
